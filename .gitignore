@@ -1,0 +1,36 @@
+# Virtual environments
+venv/
+venv311/
+.venv/
+env/
+
+# API keys and secrets
+.env
+.env.local
+.env.*.local
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+
+# Downloaded papers and vectorstore (can be regenerated)
+papers/
+vectorstore/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
