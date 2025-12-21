@@ -135,6 +135,7 @@ class Config:
         self.max_results = 5
         self.embedding_model = 'pubmedbert'  # 기본값을 PubMedBERT로 변경
         self.sparse_method = 'bm25'  # 'bm25' 또는 'splade'
+        self.vector_db = 'faiss'  # 'faiss' 또는 'qdrant'
         self.chunk_size = 1000
         self.chunk_overlap = 200
         # .env 파일에서 API 키 로드
@@ -209,6 +210,16 @@ class Config:
             '2': 'splade'
         }.get(sparse_choice, 'bm25')
 
+        # Vector DB 선택
+        print("\n🗄️ Vector DB 선택:")
+        print("   1. FAISS (Facebook AI, 로컬 파일 저장) [기본값]")
+        print("   2. Qdrant (Named Vectors, HNSW 인덱스, Payload 필터링)")
+        db_choice = input("선택 [1 - FAISS]: ").strip() or "1"
+        self.vector_db = {
+            '1': 'faiss',
+            '2': 'qdrant'
+        }.get(db_choice, 'faiss')
+
         # PubMed API 설정
         if self.search_source in ['pubmed', 'both']:
             print("\n🔑 PubMed API 설정 (선택사항 - 속도 향상):")
@@ -249,6 +260,7 @@ class Config:
         print(f"   📄 최대 논문: {self.max_results}")
         print(f"   🧠 Dense 모델: {self.embedding_model}")
         print(f"   🔤 Sparse 방식: {self.sparse_method.upper()}")
+        print(f"   🗄️ Vector DB: {self.vector_db.upper()}")
         if self.pubmed_api_key:
             print(f"   🔑 PubMed API: 설정됨")
         if self.openai_api_key:
@@ -996,6 +1008,645 @@ class RAGSystem:
         return chunks
 
 
+# ==================== Qdrant Hybrid Search 시스템 ====================
+class QdrantHybridSearch:
+    """
+    Qdrant 기반 Hybrid Search 시스템
+    - Named Vectors: dense + sparse 동시 저장
+    - Payload Filtering: 메타데이터 기반 필터링
+    - HNSW Index: 빠른 ANN 검색
+    """
+
+    def __init__(
+        self,
+        embeddings,
+        sparse_encoder=None,
+        collection_name: str = "papers",
+        use_memory: bool = True,
+        qdrant_url: str = None,
+        sparse_method: str = 'bm25'
+    ):
+        from qdrant_client import QdrantClient
+        from qdrant_client.models import (
+            VectorParams, SparseVectorParams, Distance,
+            HnswConfigDiff, OptimizersConfigDiff
+        )
+
+        self.embeddings = embeddings
+        self.collection_name = collection_name
+        self.sparse_method = sparse_method.lower()
+        self.chunks = []
+        self.splade_encoder = None
+
+        # Qdrant 클라이언트 초기화
+        if use_memory:
+            print("\n🗄️ Qdrant 인메모리 모드로 초기화...")
+            self.client = QdrantClient(":memory:")
+        else:
+            print(f"\n🗄️ Qdrant 서버 연결: {qdrant_url}")
+            self.client = QdrantClient(url=qdrant_url)
+
+        # Dense 벡터 차원 확인
+        test_embedding = self.embeddings.embed_query("test")
+        self.dense_dim = len(test_embedding)
+        print(f"   📐 Dense 벡터 차원: {self.dense_dim}")
+
+        # Sparse 인코더 초기화
+        if self.sparse_method == 'splade':
+            self._init_splade_encoder(sparse_encoder)
+        else:
+            # BM25용 스테머 초기화
+            self._init_stemmer()
+            print(f"   🔤 Sparse 방식: BM25 (스테밍)")
+
+    def _init_splade_encoder(self, sparse_encoder=None):
+        """SPLADE 인코더 초기화"""
+        if sparse_encoder is not None:
+            self.splade_encoder = sparse_encoder
+            print(f"   🔤 Sparse 방식: SPLADE (외부 인코더)")
+        else:
+            try:
+                print(f"   🔤 SPLADE 인코더 로딩 중...")
+                self.splade_encoder = SPLADEEncoder(device='cpu')
+                print(f"   ✅ SPLADE 인코더 로드 완료!")
+            except Exception as e:
+                print(f"   ⚠️ SPLADE 로드 실패: {e}")
+                print(f"   ⚠️ BM25로 폴백합니다.")
+                self.sparse_method = 'bm25'
+                self._init_stemmer()
+
+    def _init_stemmer(self):
+        """스테머 초기화"""
+        try:
+            from nltk.stem import PorterStemmer
+            self.stemmer = PorterStemmer()
+            self.use_stemming = True
+        except ImportError:
+            self.stemmer = None
+            self.use_stemming = False
+
+    def _tokenize(self, text: str) -> List[str]:
+        """토크나이저 + 스테밍"""
+        import re
+        text = text.lower()
+        tokens = re.findall(r'\b\w+\b', text)
+        if self.use_stemming and self.stemmer:
+            tokens = [self.stemmer.stem(token) for token in tokens]
+        return tokens
+
+    def _text_to_sparse_vector(self, text: str) -> Dict[int, float]:
+        """텍스트를 스파스 벡터로 변환 (BM25 또는 SPLADE)"""
+        if self.sparse_method == 'splade' and self.splade_encoder is not None:
+            return self._splade_to_sparse_vector(text)
+        else:
+            return self._bm25_to_sparse_vector(text)
+
+    def _bm25_to_sparse_vector(self, text: str) -> Dict[int, float]:
+        """BM25 스타일 스파스 벡터 생성"""
+        from collections import Counter
+        import math
+
+        tokens = self._tokenize(text)
+        token_counts = Counter(tokens)
+
+        sparse_vector = {}
+        for token, count in token_counts.items():
+            # 해시 함수로 인덱스 생성 (vocabulary 대신)
+            idx = hash(token) % 30000  # 30000 차원으로 제한
+            if idx < 0:
+                idx = -idx
+            tf = 1 + math.log(count) if count > 0 else 0
+            sparse_vector[idx] = tf
+
+        return sparse_vector
+
+    def _splade_to_sparse_vector(self, text: str) -> Dict[int, float]:
+        """SPLADE 인코더를 사용한 스파스 벡터 생성"""
+        # SPLADE 인코딩 (token -> weight 딕셔너리 반환)
+        splade_result = self.splade_encoder.encode([text])[0]
+
+        # token 문자열을 정수 인덱스로 변환
+        sparse_vector = {}
+        for token, weight in splade_result.items():
+            # 해시 함수로 인덱스 생성
+            idx = hash(token) % 30000
+            if idx < 0:
+                idx = -idx
+            # 같은 인덱스에 여러 토큰이 매핑되면 최대값 사용
+            if idx in sparse_vector:
+                sparse_vector[idx] = max(sparse_vector[idx], weight)
+            else:
+                sparse_vector[idx] = weight
+
+        return sparse_vector
+
+    def create_collection(self):
+        """컬렉션 생성 (Named Vectors + HNSW 인덱스)"""
+        from qdrant_client.models import (
+            VectorParams, SparseVectorParams, Distance,
+            HnswConfigDiff, OptimizersConfigDiff
+        )
+
+        # 기존 컬렉션 삭제
+        try:
+            self.client.delete_collection(self.collection_name)
+        except:
+            pass
+
+        print(f"\n📦 Qdrant 컬렉션 생성: {self.collection_name}")
+        print("   🔧 HNSW 인덱스 설정 중...")
+
+        # Named Vectors로 컬렉션 생성
+        self.client.create_collection(
+            collection_name=self.collection_name,
+            vectors_config={
+                # Dense 벡터 (HNSW 인덱스)
+                "dense": VectorParams(
+                    size=self.dense_dim,
+                    distance=Distance.COSINE,
+                    hnsw_config=HnswConfigDiff(
+                        m=16,              # 연결 수 (높을수록 정확, 느림)
+                        ef_construct=100,  # 구축 시 탐색 범위
+                        full_scan_threshold=10000
+                    )
+                )
+            },
+            sparse_vectors_config={
+                # Sparse 벡터
+                "sparse": SparseVectorParams()
+            },
+            optimizers_config=OptimizersConfigDiff(
+                indexing_threshold=20000  # 인덱싱 임계값
+            )
+        )
+
+        print("   ✅ Dense 벡터: HNSW 인덱스 (COSINE)")
+        print(f"   ✅ Sparse 벡터: {self.sparse_method.upper()} + Inverted Index")
+
+    def add_documents(self, documents: List[Dict], text_splitter):
+        """문서 추가 (청킹 + 임베딩 + 저장)"""
+        from qdrant_client.models import PointStruct, SparseVector
+        import uuid
+
+        print("\n📄 문서 처리 중...")
+
+        all_chunks = []
+        all_metadata = []
+
+        # 청킹
+        for doc in documents:
+            chunks = text_splitter.split_text(doc['text'])
+            for i, chunk in enumerate(chunks):
+                all_chunks.append(chunk)
+                # 풍부한 메타데이터
+                all_metadata.append({
+                    'source': doc['source'],
+                    'filepath': doc.get('filepath', ''),
+                    'chunk_id': i,
+                    'chunk_total': len(chunks),
+                    'text_length': len(chunk)
+                })
+            print(f"   📄 {doc['source'][:40]}...: {len(chunks)} 청크")
+
+        print(f"\n📊 총 청크 수: {len(all_chunks)}개")
+
+        if not all_chunks:
+            raise ValueError("청킹된 텍스트가 없습니다!")
+
+        self.chunks = [{'content': c, **m} for c, m in zip(all_chunks, all_metadata)]
+
+        # Dense 임베딩 생성
+        print("\n🧠 Dense 임베딩 생성 중...")
+        dense_vectors = self.embeddings.embed_documents(all_chunks)
+
+        # Sparse 벡터 생성
+        sparse_method_name = self.sparse_method.upper()
+        print(f"🔤 Sparse 벡터 생성 중... ({sparse_method_name})")
+        sparse_vectors = []
+        for chunk in all_chunks:
+            sv = self._text_to_sparse_vector(chunk)
+            sparse_vectors.append(sv)
+
+        # Qdrant에 저장
+        print("\n💾 Qdrant에 저장 중...")
+        points = []
+        for i, (chunk, dense_vec, sparse_vec, metadata) in enumerate(
+            zip(all_chunks, dense_vectors, sparse_vectors, all_metadata)
+        ):
+            # Sparse 벡터를 Qdrant 형식으로 변환
+            sparse_indices = list(sparse_vec.keys())
+            sparse_values = list(sparse_vec.values())
+
+            point = PointStruct(
+                id=str(uuid.uuid4()),
+                vector={
+                    "dense": dense_vec,
+                    "sparse": SparseVector(
+                        indices=sparse_indices,
+                        values=sparse_values
+                    )
+                },
+                payload={
+                    "text": chunk,
+                    **metadata
+                }
+            )
+            points.append(point)
+
+            if (i + 1) % 50 == 0:
+                print(f"   진행: {i + 1}/{len(all_chunks)}", end='\r')
+
+        # 배치 업로드
+        batch_size = 100
+        for i in range(0, len(points), batch_size):
+            batch = points[i:i + batch_size]
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=batch
+            )
+
+        print(f"\n✅ Qdrant 저장 완료! ({len(points)}개 벡터)")
+
+        # 컬렉션 정보 출력
+        info = self.client.get_collection(self.collection_name)
+        print(f"   📊 컬렉션 상태: {info.status}")
+        print(f"   📊 포인트 수: {info.points_count}")
+
+    def dense_search(self, query: str, k: int = 5, filter_conditions: Dict = None) -> List[Dict]:
+        """Dense 벡터 검색 (HNSW ANN)"""
+        from qdrant_client.models import Filter, FieldCondition, MatchValue, SearchParams
+
+        query_vector = self.embeddings.embed_query(query)
+
+        # 필터 조건 구성
+        query_filter = None
+        if filter_conditions:
+            conditions = []
+            for field, value in filter_conditions.items():
+                conditions.append(
+                    FieldCondition(key=field, match=MatchValue(value=value))
+                )
+            query_filter = Filter(must=conditions)
+
+        # 새로운 Qdrant API 사용
+        results = self.client.query_points(
+            collection_name=self.collection_name,
+            query=query_vector,
+            using="dense",
+            query_filter=query_filter,
+            limit=k,
+            with_payload=True,
+            search_params=SearchParams(hnsw_ef=128)
+        )
+
+        return [
+            {
+                'content': r.payload.get('text', ''),
+                'source': r.payload.get('source', 'Unknown'),
+                'score': r.score,
+                'chunk_id': r.payload.get('chunk_id', 0),
+                'method': 'dense'
+            }
+            for r in results.points
+        ]
+
+    def sparse_search(self, query: str, k: int = 5, filter_conditions: Dict = None) -> List[Dict]:
+        """Sparse 벡터 검색"""
+        from qdrant_client.models import Filter, FieldCondition, MatchValue, SparseVector
+
+        sparse_vec = self._text_to_sparse_vector(query)
+        sparse_indices = list(sparse_vec.keys())
+        sparse_values = list(sparse_vec.values())
+
+        # 필터 조건 구성
+        query_filter = None
+        if filter_conditions:
+            conditions = []
+            for field, value in filter_conditions.items():
+                conditions.append(
+                    FieldCondition(key=field, match=MatchValue(value=value))
+                )
+            query_filter = Filter(must=conditions)
+
+        # 새로운 Qdrant API 사용
+        results = self.client.query_points(
+            collection_name=self.collection_name,
+            query=SparseVector(
+                indices=sparse_indices,
+                values=sparse_values
+            ),
+            using="sparse",
+            query_filter=query_filter,
+            limit=k,
+            with_payload=True
+        )
+
+        return [
+            {
+                'content': r.payload.get('text', ''),
+                'source': r.payload.get('source', 'Unknown'),
+                'score': r.score,
+                'chunk_id': r.payload.get('chunk_id', 0),
+                'method': 'sparse'
+            }
+            for r in results.points
+        ]
+
+    def hybrid_search(
+        self,
+        query: str,
+        k: int = 5,
+        alpha: float = 0.5,
+        filter_conditions: Dict = None
+    ) -> List[Dict]:
+        """
+        Hybrid 검색 (Dense + Sparse)
+        alpha: 0.0 = 순수 Sparse, 1.0 = 순수 Dense
+        """
+        import numpy as np
+
+        # 더 많은 후보 검색
+        num_candidates = max(k * 3, 20)
+
+        dense_results = self.dense_search(query, k=num_candidates, filter_conditions=filter_conditions)
+        sparse_results = self.sparse_search(query, k=num_candidates, filter_conditions=filter_conditions)
+
+        # 점수 정규화를 위한 최대/최소값
+        dense_scores = [r['score'] for r in dense_results] if dense_results else [0]
+        sparse_scores = [r['score'] for r in sparse_results] if sparse_results else [0]
+
+        dense_max, dense_min = max(dense_scores), min(dense_scores)
+        sparse_max, sparse_min = max(sparse_scores), min(sparse_scores)
+
+        dense_range = dense_max - dense_min if dense_max > dense_min else 1.0
+        sparse_range = sparse_max - sparse_min if sparse_max > sparse_min else 1.0
+
+        # 결과 통합
+        doc_scores = {}
+
+        for r in dense_results:
+            key = r['content'][:100]
+            dense_norm = (r['score'] - dense_min) / dense_range
+            doc_scores[key] = {
+                'content': r['content'],
+                'source': r['source'],
+                'chunk_id': r['chunk_id'],
+                'dense_score': r['score'],
+                'dense_norm': dense_norm,
+                'sparse_score': 0,
+                'sparse_norm': 0
+            }
+
+        for r in sparse_results:
+            key = r['content'][:100]
+            sparse_norm = (r['score'] - sparse_min) / sparse_range
+
+            if key in doc_scores:
+                doc_scores[key]['sparse_score'] = r['score']
+                doc_scores[key]['sparse_norm'] = sparse_norm
+            else:
+                doc_scores[key] = {
+                    'content': r['content'],
+                    'source': r['source'],
+                    'chunk_id': r['chunk_id'],
+                    'dense_score': 0,
+                    'dense_norm': 0,
+                    'sparse_score': r['score'],
+                    'sparse_norm': sparse_norm
+                }
+
+        # Hybrid 점수 계산
+        results = []
+        for key, data in doc_scores.items():
+            hybrid_score = alpha * data['dense_norm'] + (1 - alpha) * data['sparse_norm']
+            results.append({
+                'content': data['content'],
+                'source': data['source'],
+                'chunk_id': data['chunk_id'],
+                'hybrid_score': hybrid_score,
+                'dense_score': data['dense_score'],
+                'dense_norm': data['dense_norm'],
+                'sparse_score': data['sparse_score'],
+                'sparse_norm': data['sparse_norm'],
+                'method': 'hybrid'
+            })
+
+        # 정렬 및 반환
+        results.sort(key=lambda x: x['hybrid_score'], reverse=True)
+        return results[:k]
+
+    def search_with_filter(
+        self,
+        query: str,
+        source_filter: str = None,
+        min_chunk_length: int = None,
+        k: int = 5,
+        search_type: str = 'hybrid'
+    ) -> List[Dict]:
+        """Payload 필터링을 적용한 검색"""
+        from qdrant_client.models import Filter, FieldCondition, MatchValue, Range
+
+        conditions = []
+
+        if source_filter:
+            conditions.append(
+                FieldCondition(
+                    key="source",
+                    match=MatchValue(value=source_filter)
+                )
+            )
+
+        if min_chunk_length:
+            conditions.append(
+                FieldCondition(
+                    key="text_length",
+                    range=Range(gte=min_chunk_length)
+                )
+            )
+
+        query_filter = Filter(must=conditions) if conditions else None
+
+        filter_dict = {}
+        if source_filter:
+            filter_dict['source'] = source_filter
+
+        if search_type == 'dense':
+            return self.dense_search(query, k, filter_conditions=filter_dict if filter_dict else None)
+        elif search_type == 'sparse':
+            return self.sparse_search(query, k, filter_conditions=filter_dict if filter_dict else None)
+        else:
+            return self.hybrid_search(query, k, filter_conditions=filter_dict if filter_dict else None)
+
+    def get_collection_info(self) -> Dict:
+        """컬렉션 정보 조회"""
+        info = self.client.get_collection(self.collection_name)
+        return {
+            'name': self.collection_name,
+            'status': str(info.status),
+            'points_count': info.points_count,
+            'vectors_count': info.vectors_count,
+            'indexed_vectors_count': info.indexed_vectors_count
+        }
+
+    def get_sparse_method_name(self) -> str:
+        """현재 사용 중인 sparse 방식 이름 반환"""
+        return self.sparse_method.upper()
+
+    def visualize_comparison(
+        self,
+        query: str,
+        sparse_results: List[Dict],
+        dense_results: List[Dict],
+        hybrid_results: List[Dict],
+        alpha: float = 0.7,
+        sparse_method: str = 'BM25',
+        dense_model: str = 'Dense',
+        save_path: str = None,
+        show_plot: bool = True
+    ) -> str:
+        """Qdrant 검색 결과 시각화"""
+        import matplotlib.pyplot as plt
+        import matplotlib
+
+        # 대화형 백엔드 사용 (show_plot이 True일 때)
+        if show_plot:
+            try:
+                matplotlib.use('TkAgg')
+            except:
+                matplotlib.use('Agg')
+        else:
+            matplotlib.use('Agg')
+
+        # 한글 폰트 설정
+        plt.rcParams['font.family'] = ['AppleGothic', 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
+
+        fig, axes = plt.subplots(2, 2, figsize=(15, 11))
+        fig.suptitle(f'🔍 Qdrant Hybrid Search Analysis\nQuery: "{query[:60]}..."',
+                    fontsize=14, fontweight='bold')
+
+        # 1. Sparse 점수 (왼쪽 상단)
+        ax1 = axes[0, 0]
+        if sparse_results:
+            sparse_labels = [f"Doc {i+1}\n{r['source'][:20]}..." for i, r in enumerate(sparse_results[:5])]
+            sparse_scores = [r['score'] for r in sparse_results[:5]]
+            colors1 = plt.cm.Blues([(0.4 + 0.12*i) for i in range(len(sparse_scores))])
+            bars1 = ax1.barh(sparse_labels, sparse_scores, color=colors1, edgecolor='navy', alpha=0.85)
+            ax1.set_xlabel(f'{sparse_method} Score', fontweight='bold')
+            ax1.set_title(f'🔵 Sparse Search ({sparse_method})', fontweight='bold', fontsize=11)
+            ax1.invert_yaxis()
+            for bar, score in zip(bars1, sparse_scores):
+                ax1.text(bar.get_width() + 0.02, bar.get_y() + bar.get_height()/2,
+                        f'{score:.3f}', va='center', fontsize=9, fontweight='bold')
+            ax1.set_xlim(0, max(sparse_scores) * 1.3 if sparse_scores else 1)
+
+        # 2. Dense 점수 (오른쪽 상단)
+        ax2 = axes[0, 1]
+        if dense_results:
+            dense_labels = [f"Doc {i+1}\n{r['source'][:20]}..." for i, r in enumerate(dense_results[:5])]
+            dense_scores = [r['score'] for r in dense_results[:5]]
+            colors2 = plt.cm.Reds([(0.4 + 0.12*i) for i in range(len(dense_scores))])
+            bars2 = ax2.barh(dense_labels, dense_scores, color=colors2, edgecolor='darkred', alpha=0.85)
+            ax2.set_xlabel('Cosine Similarity (higher = better)', fontweight='bold')
+            ax2.set_title(f'🔴 Dense Search (HNSW, {dense_model})', fontweight='bold', fontsize=11)
+            ax2.invert_yaxis()
+            for bar, score in zip(bars2, dense_scores):
+                ax2.text(bar.get_width() + 0.01, bar.get_y() + bar.get_height()/2,
+                        f'{score:.4f}', va='center', fontsize=9, fontweight='bold')
+            ax2.set_xlim(0, max(dense_scores) * 1.2 if dense_scores else 1)
+
+        # 3. Hybrid 점수 비교 (왼쪽 하단)
+        ax3 = axes[1, 0]
+        if hybrid_results:
+            hybrid_labels = [f"Doc {i+1}" for i in range(len(hybrid_results[:5]))]
+            x = range(len(hybrid_labels))
+            width = 0.25
+
+            sparse_norm = [r.get('sparse_norm', 0) for r in hybrid_results[:5]]
+            dense_norm = [r.get('dense_norm', 0) for r in hybrid_results[:5]]
+            hybrid_scores = [r['hybrid_score'] for r in hybrid_results[:5]]
+
+            bars_sparse = ax3.bar([i - width for i in x], sparse_norm, width,
+                                 label=f'{sparse_method} (norm)', color='#3498db', alpha=0.85, edgecolor='navy')
+            bars_dense = ax3.bar(x, dense_norm, width,
+                                label='Dense (norm)', color='#e74c3c', alpha=0.85, edgecolor='darkred')
+            bars_hybrid = ax3.bar([i + width for i in x], hybrid_scores, width,
+                                 label='Hybrid', color='#2ecc71', alpha=0.85, edgecolor='darkgreen')
+
+            ax3.set_xlabel('Document', fontweight='bold')
+            ax3.set_ylabel('Normalized Score (0-1)', fontweight='bold')
+            ax3.set_title(f'🟢 Hybrid Score Fusion (α={alpha})\n{sparse_method}×{1-alpha:.1f} + Dense×{alpha:.1f}',
+                         fontweight='bold', fontsize=11)
+            ax3.set_xticks(x)
+            ax3.set_xticklabels(hybrid_labels)
+            ax3.set_ylim(0, 1.15)
+            ax3.legend(loc='upper right', fontsize=9)
+            ax3.grid(axis='y', alpha=0.3)
+
+            # 하이브리드 점수 표시
+            for bar, score in zip(bars_hybrid, hybrid_scores):
+                ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                        f'{score:.2f}', ha='center', va='bottom', fontsize=8, fontweight='bold')
+
+        # 4. 상세 결과 요약 (오른쪽 하단)
+        ax4 = axes[1, 1]
+        ax4.axis('off')
+
+        info_text = "📊 Qdrant Search Results Summary\n" + "="*45 + "\n\n"
+
+        info_text += f"🔵 Sparse ({sparse_method}) - Top 3:\n"
+        for i, r in enumerate(sparse_results[:3], 1):
+            source = r['source'][:35] + "..." if len(r['source']) > 35 else r['source']
+            info_text += f"  {i}. {source}\n"
+            info_text += f"     Score: {r['score']:.4f}\n"
+
+        info_text += f"\n🔴 Dense (HNSW) - Top 3:\n"
+        for i, r in enumerate(dense_results[:3], 1):
+            source = r['source'][:35] + "..." if len(r['source']) > 35 else r['source']
+            info_text += f"  {i}. {source}\n"
+            info_text += f"     Cosine: {r['score']:.4f}\n"
+
+        info_text += f"\n🟢 Hybrid (α={alpha}) - Top 3:\n"
+        for i, r in enumerate(hybrid_results[:3], 1):
+            source = r['source'][:35] + "..." if len(r['source']) > 35 else r['source']
+            sparse_s = r.get('sparse_score', 0)
+            dense_s = r.get('dense_score', 0)
+            hybrid_s = r.get('hybrid_score', 0)
+            info_text += f"  {i}. {source}\n"
+            info_text += f"     Hybrid: {hybrid_s:.3f} (S:{sparse_s:.3f} D:{dense_s:.3f})\n"
+
+        info_text += f"\n📈 Statistics:\n"
+        info_text += f"  • Collection: {self.collection_name}\n"
+        info_text += f"  • Total chunks: {len(self.chunks)}\n"
+        info_text += f"  • Dense dim: {self.dense_dim}\n"
+
+        ax4.text(0.02, 0.98, info_text, transform=ax4.transAxes, fontsize=9,
+                verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='lightyellow',
+                         alpha=0.9, edgecolor='orange'))
+
+        plt.tight_layout()
+
+        # 저장
+        if save_path is None:
+            save_path = f"qdrant_hybrid_search_{query[:20].replace(' ', '_')}.png"
+
+        plt.savefig(save_path, dpi=150, bbox_inches='tight',
+                   facecolor='white', edgecolor='none')
+        print(f"\n📊 시각화 저장: {save_path}")
+
+        # 그래프 표시
+        if show_plot:
+            try:
+                plt.show()
+                print("   ✅ 그래프 창이 열렸습니다. 창을 닫으면 계속 진행됩니다.")
+            except Exception as e:
+                print(f"   ⚠️ 대화형 표시 실패: {e}")
+
+        plt.close()
+        return save_path
+
+
 # ==================== SPLADE Encoder ====================
 class SPLADEEncoder:
     """SPLADE (Sparse Lexical and Expansion) 인코더"""
@@ -1336,11 +1987,19 @@ class HybridSearchSystem:
         }
 
     def visualize_comparison(self, query: str, k: int = 5, alpha: float = 0.5,
-                            save_path: str = None) -> None:
+                            save_path: str = None, show_plot: bool = True) -> None:
         """검색 결과 시각화"""
         import matplotlib.pyplot as plt
         import matplotlib
-        matplotlib.use('Agg')  # 비대화형 백엔드
+
+        # 대화형 백엔드 사용 (show_plot이 True일 때)
+        if show_plot:
+            try:
+                matplotlib.use('TkAgg')
+            except:
+                matplotlib.use('Agg')
+        else:
+            matplotlib.use('Agg')
 
         # 한글 폰트 설정
         plt.rcParams['font.family'] = ['AppleGothic', 'DejaVu Sans']
@@ -1437,8 +2096,18 @@ class HybridSearchSystem:
         if save_path is None:
             save_path = f"./hybrid_search_comparison.png"
 
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.savefig(save_path, dpi=150, bbox_inches='tight',
+                   facecolor='white', edgecolor='none')
         print(f"\n📊 시각화 저장 완료: {save_path}")
+
+        # 그래프 표시
+        if show_plot:
+            try:
+                plt.show()
+                print("   ✅ 그래프 창이 열렸습니다. 창을 닫으면 계속 진행됩니다.")
+            except Exception as e:
+                print(f"   ⚠️ 대화형 표시 실패: {e}")
+
         plt.close()
 
         return results
@@ -1662,59 +2331,156 @@ def main():
     print("💾 Step 5: RAG 시스템 구축")
     print("=" * 60)
 
-    rag = RAGSystem(
-        embeddings=embeddings,
+    # Text Splitter 생성
+    text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=config.chunk_size,
         chunk_overlap=config.chunk_overlap,
-        language=config.language
+        length_function=len
     )
 
-    vectorstore = rag.build_vectorstore(documents)
-    rag.save_vectorstore(VECTORSTORE_DIR)
+    # Vector DB 선택에 따라 분기
+    if config.vector_db == 'qdrant':
+        # Qdrant 기반 시스템
+        print(f"\n🗄️ Qdrant Vector DB 사용")
 
-    # 8. Hybrid Search 분석 및 시각화
-    print("\n" + "=" * 60)
-    print("🔀 Step 6: Hybrid Search 분석")
-    print("=" * 60)
+        qdrant_search = QdrantHybridSearch(
+            embeddings=embeddings,
+            sparse_method=config.sparse_method,
+            collection_name="medical_papers",
+            use_memory=True  # 인메모리 모드
+        )
+        qdrant_search.create_collection()
+        qdrant_search.add_documents(documents, text_splitter)
 
-    hybrid_searcher = HybridSearchSystem(rag, sparse_method=config.sparse_method)
+        # RAG 시스템도 생성 (interactive_qa용)
+        rag = RAGSystem(
+            embeddings=embeddings,
+            chunk_size=config.chunk_size,
+            chunk_overlap=config.chunk_overlap,
+            language=config.language
+        )
+        rag.build_vectorstore(documents)
 
-    # 검색어로 3가지 검색 방식 비교
-    test_query = search_query  # 원래 검색어 사용
-    print(f"\n🔍 검색어: '{test_query}'")
-    print("-" * 40)
+        # 8. Hybrid Search 분석 및 시각화 (Qdrant)
+        print("\n" + "=" * 60)
+        print("🔀 Step 6: Qdrant Hybrid Search 분석")
+        print("=" * 60)
 
-    search_results = hybrid_searcher.compare_all(test_query, k=5, alpha=0.5)
+        test_query = search_query
+        print(f"\n🔍 검색어: '{test_query}'")
+        print("-" * 40)
 
-    # Sparse 방식 이름
-    sparse_name = config.sparse_method.upper()
+        # Qdrant 검색 실행
+        sparse_results = qdrant_search.sparse_search(test_query, k=5)
+        dense_results = qdrant_search.dense_search(test_query, k=5)
+        hybrid_results = qdrant_search.hybrid_search(test_query, k=5, alpha=0.7)
 
-    # 결과 출력
-    print(f"\n🔵 Sparse Search ({sparse_name}) 결과:")
-    for i, r in enumerate(search_results['sparse'][:3], 1):
-        sparse_score = r['score']
-        source = r['source'][:50]
-        print(f"   [{i}] {sparse_name}: {sparse_score:.2f} | {source}...")
+        # 실제 사용 중인 sparse 방식 (SPLADE 로드 실패 시 BM25로 폴백될 수 있음)
+        sparse_name = qdrant_search.get_sparse_method_name()
 
-    print(f"\n🔴 Dense Search ({config.embedding_model}) 결과:")
-    for i, r in enumerate(search_results['dense'][:3], 1):
-        l2_dist = r['score']
-        source = r['source'][:50]
-        print(f"   [{i}] L2 Dist: {l2_dist:.4f} | {source}...")
+        # Sparse 결과
+        print(f"\n🔵 Qdrant Sparse Search ({sparse_name}) 결과:")
+        for i, r in enumerate(sparse_results[:3], 1):
+            score = r['score']
+            source = r['source'][:50]
+            print(f"   [{i}] {sparse_name}: {score:.4f} | {source}...")
 
-    print(f"\n🟢 Hybrid Search 결과 ({sparse_name} + {config.embedding_model}, α=0.5):")
-    for i, r in enumerate(search_results['hybrid'][:3], 1):
-        sparse_raw = r.get('sparse_score', 0)
-        sparse_norm = r.get('sparse_score_norm', 0)
-        sem_norm = r.get('dense_score_norm', 0)
-        hybrid_score = r.get('hybrid_score', 0)
-        source = r['source'][:50]
-        print(f"   [{i}] Hybrid: {hybrid_score:.2f} | {sparse_name}={sparse_raw:.1f}({sparse_norm:.2f}) + Semantic({sem_norm:.2f})")
-        print(f"       {source}...")
+        # Dense 결과 (HNSW)
+        print(f"\n🔴 Qdrant Dense Search (HNSW, {config.embedding_model}) 결과:")
+        for i, r in enumerate(dense_results[:3], 1):
+            score = r['score']
+            source = r['source'][:50]
+            print(f"   [{i}] Cosine: {score:.4f} | {source}...")
 
-    # 시각화 저장
-    print("\n📊 시각화 생성 중...")
-    hybrid_searcher.visualize_comparison(test_query, k=5, alpha=0.5)
+        # Hybrid 결과
+        print(f"\n🟢 Qdrant Hybrid Search 결과 ({sparse_name} + Dense, α=0.7):")
+        for i, r in enumerate(hybrid_results[:3], 1):
+            hybrid_score = r.get('hybrid_score', 0)
+            sparse_score = r.get('sparse_score', 0)
+            dense_score = r.get('dense_score', 0)
+            source = r['source'][:50]
+            print(f"   [{i}] Hybrid: {hybrid_score:.3f} | Sparse={sparse_score:.3f} + Dense={dense_score:.3f}")
+            print(f"       {source}...")
+
+        # Payload 필터링 예시
+        print(f"\n🔎 Payload 필터링 테스트:")
+        filtered_results = qdrant_search.search_with_filter(
+            test_query,
+            min_chunk_length=100,
+            k=3
+        )
+        print(f"   (최소 청크 길이 100자 이상 필터)")
+        for i, r in enumerate(filtered_results[:3], 1):
+            print(f"   [{i}] {r['source'][:50]}...")
+
+        # 시각화 생성 및 표시
+        print("\n📊 시각화 생성 중...")
+        qdrant_search.visualize_comparison(
+            query=test_query,
+            sparse_results=sparse_results,
+            dense_results=dense_results,
+            hybrid_results=hybrid_results,
+            alpha=0.7,
+            sparse_method=sparse_name,
+            dense_model=config.embedding_model,
+            show_plot=True
+        )
+
+    else:
+        # FAISS 기반 시스템 (기존)
+        print(f"\n🗄️ FAISS Vector DB 사용")
+
+        rag = RAGSystem(
+            embeddings=embeddings,
+            chunk_size=config.chunk_size,
+            chunk_overlap=config.chunk_overlap,
+            language=config.language
+        )
+
+        vectorstore = rag.build_vectorstore(documents)
+        rag.save_vectorstore(VECTORSTORE_DIR)
+
+        # 8. Hybrid Search 분석 및 시각화 (FAISS)
+        print("\n" + "=" * 60)
+        print("🔀 Step 6: Hybrid Search 분석")
+        print("=" * 60)
+
+        hybrid_searcher = HybridSearchSystem(rag, sparse_method=config.sparse_method)
+
+        test_query = search_query
+        print(f"\n🔍 검색어: '{test_query}'")
+        print("-" * 40)
+
+        search_results = hybrid_searcher.compare_all(test_query, k=5, alpha=0.5)
+
+        sparse_name = config.sparse_method.upper()
+
+        # 결과 출력
+        print(f"\n🔵 Sparse Search ({sparse_name}) 결과:")
+        for i, r in enumerate(search_results['sparse'][:3], 1):
+            sparse_score = r['score']
+            source = r['source'][:50]
+            print(f"   [{i}] {sparse_name}: {sparse_score:.2f} | {source}...")
+
+        print(f"\n🔴 Dense Search ({config.embedding_model}) 결과:")
+        for i, r in enumerate(search_results['dense'][:3], 1):
+            l2_dist = r['score']
+            source = r['source'][:50]
+            print(f"   [{i}] L2 Dist: {l2_dist:.4f} | {source}...")
+
+        print(f"\n🟢 Hybrid Search 결과 ({sparse_name} + {config.embedding_model}, α=0.5):")
+        for i, r in enumerate(search_results['hybrid'][:3], 1):
+            sparse_raw = r.get('sparse_score', 0)
+            sparse_norm = r.get('sparse_score_norm', 0)
+            sem_norm = r.get('dense_score_norm', 0)
+            hybrid_score = r.get('hybrid_score', 0)
+            source = r['source'][:50]
+            print(f"   [{i}] Hybrid: {hybrid_score:.2f} | {sparse_name}={sparse_raw:.1f}({sparse_norm:.2f}) + Semantic({sem_norm:.2f})")
+            print(f"       {source}...")
+
+        # 시각화 저장 및 표시
+        print("\n📊 시각화 생성 중...")
+        hybrid_searcher.visualize_comparison(test_query, k=5, alpha=0.5, show_plot=True)
 
     # 9. 대화형 질의응답
     interactive_qa(rag, config.openai_api_key)
