@@ -133,7 +133,8 @@ class Config:
         self.search_query = ''  # 원본 검색어 (한국어 가능)
         self.search_query_en = ''  # 영어로 번역된 검색어 (실제 검색용)
         self.max_results = 5
-        self.embedding_model = 'biobert'  # 기본값을 BioBERT로 변경
+        self.embedding_model = 'pubmedbert'  # 기본값을 PubMedBERT로 변경
+        self.sparse_method = 'bm25'  # 'bm25' 또는 'splade'
         self.chunk_size = 1000
         self.chunk_overlap = 200
         # .env 파일에서 API 키 로드
@@ -174,22 +175,39 @@ class Config:
             self.max_results = int(max_res)
 
         # 임베딩 모델 선택
-        print("\n🧠 임베딩 모델 선택:")
-        print("   [HuggingFace - 로컬 실행]")
-        print("   1. BioBERT (의학/생물학) [기본값]")
-        print("   2. PubMedBERT (PubMed 논문 특화)")
-        print("   3. BERT-base (일반)")
+        print("\n🧠 Dense 임베딩 모델 선택:")
+        print("   [PubMed/의학 특화 - 로컬 실행]")
+        print("   1. PubMedBERT Full (PubMed 전문 학습) [권장]")
+        print("   2. PubMedBERT Abstract (PubMed 초록 특화)")
+        print("   3. BioBERT (의학/생물학)")
+        print("   4. BioLinkBERT (의학 문헌 링크 학습)")
+        print("   5. SciBERT (과학 논문 전반)")
+        print("   [일반 모델]")
+        print("   6. BERT-base (일반)")
         print("   [OpenAI API - 빠르고 정확]")
-        print("   4. OpenAI Small (빠름, 저렴)")
-        print("   5. OpenAI Large (고성능)")
-        model_choice = input("선택 [1 - BioBERT]: ").strip() or "1"
+        print("   7. OpenAI Small (빠름, 저렴)")
+        print("   8. OpenAI Large (고성능)")
+        model_choice = input("선택 [1 - PubMedBERT]: ").strip() or "1"
         self.embedding_model = {
-            '1': 'biobert',
-            '2': 'pubmedbert',
-            '3': 'bert-base',
-            '4': 'openai-small',
-            '5': 'openai-large'
-        }.get(model_choice, 'biobert')
+            '1': 'pubmedbert',
+            '2': 'pubmedbert-abs',
+            '3': 'biobert',
+            '4': 'biolinkbert',
+            '5': 'scibert',
+            '6': 'bert-base',
+            '7': 'openai-small',
+            '8': 'openai-large'
+        }.get(model_choice, 'pubmedbert')
+
+        # Sparse 검색 방식 선택
+        print("\n🔍 Sparse 검색 방식 선택:")
+        print("   1. BM25 (전통적 키워드 매칭) [기본값]")
+        print("   2. SPLADE (신경망 기반 확장 검색)")
+        sparse_choice = input("선택 [1 - BM25]: ").strip() or "1"
+        self.sparse_method = {
+            '1': 'bm25',
+            '2': 'splade'
+        }.get(sparse_choice, 'bm25')
 
         # PubMed API 설정
         if self.search_source in ['pubmed', 'both']:
@@ -229,7 +247,8 @@ class Config:
             print(f"   🔍 검색어(영문): {self.search_query_en}")
         print(f"   🌐 언어: {lang_name} (응답도 {lang_name}로)")
         print(f"   📄 최대 논문: {self.max_results}")
-        print(f"   🧠 모델: {self.embedding_model}")
+        print(f"   🧠 Dense 모델: {self.embedding_model}")
+        print(f"   🔤 Sparse 방식: {self.sparse_method.upper()}")
         if self.pubmed_api_key:
             print(f"   🔑 PubMed API: 설정됨")
         if self.openai_api_key:
@@ -770,24 +789,45 @@ class EmbeddingModelFactory:
     """임베딩 모델 팩토리 - HuggingFace 또는 OpenAI 선택 가능"""
 
     MODELS = {
+        # PubMed/의학 특화 모델
+        'pubmedbert': {
+            'name': 'microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext',
+            'description': 'PubMed 논문 특화 (PubMedBERT Full)',
+            'dimension': 768,
+            'type': 'huggingface'
+        },
+        'pubmedbert-abs': {
+            'name': 'microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract',
+            'description': 'PubMed 초록 특화 (PubMedBERT Abstract)',
+            'dimension': 768,
+            'type': 'huggingface'
+        },
         'biobert': {
             'name': 'dmis-lab/biobert-base-cased-v1.2',
-            'description': '의학/생물학 특화 (BioBERT)',
+            'description': '의학/생물학 특화 (BioBERT v1.2)',
             'dimension': 768,
             'type': 'huggingface'
         },
-        'pubmedbert': {
-            'name': 'microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract',
-            'description': 'PubMed 논문 특화 (BiomedBERT)',
+        'scibert': {
+            'name': 'allenai/scibert_scivocab_uncased',
+            'description': '과학 논문 특화 (SciBERT)',
             'dimension': 768,
             'type': 'huggingface'
         },
+        'biolinkbert': {
+            'name': 'michiyasunaga/BioLinkBERT-base',
+            'description': '의학 문헌 링크 학습 (BioLinkBERT)',
+            'dimension': 768,
+            'type': 'huggingface'
+        },
+        # 일반 모델
         'bert-base': {
             'name': 'bert-base-uncased',
             'description': 'BERT 기본 모델',
             'dimension': 768,
             'type': 'huggingface'
         },
+        # OpenAI API 모델
         'openai-small': {
             'name': 'text-embedding-3-small',
             'description': 'OpenAI 임베딩 (빠름, 저렴)',
@@ -956,26 +996,138 @@ class RAGSystem:
         return chunks
 
 
+# ==================== SPLADE Encoder ====================
+class SPLADEEncoder:
+    """SPLADE (Sparse Lexical and Expansion) 인코더"""
+
+    def __init__(self, model_name: str = "naver/splade-cocondenser-ensembledistil", device: str = 'cpu'):
+        import torch
+        from transformers import AutoTokenizer, AutoModelForMaskedLM
+
+        self.device = device
+        self.model_name = model_name
+
+        print(f"   📥 SPLADE 모델 로드 중: {model_name}")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForMaskedLM.from_pretrained(model_name)
+        self.model.to(device)
+        self.model.eval()
+        self.torch = torch
+
+    def encode(self, texts: List[str], max_length: int = 256) -> List[Dict[str, float]]:
+        """텍스트를 SPLADE 스파스 벡터로 인코딩"""
+        sparse_vectors = []
+
+        for text in texts:
+            # 토큰화
+            inputs = self.tokenizer(
+                text,
+                return_tensors="pt",
+                max_length=max_length,
+                truncation=True,
+                padding=True
+            )
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+            # SPLADE 인코딩
+            with self.torch.no_grad():
+                outputs = self.model(**inputs)
+                # SPLADE: log(1 + ReLU(logits)) * attention_mask
+                logits = outputs.logits
+                relu_log = self.torch.log1p(self.torch.relu(logits))
+                # Max pooling over sequence
+                weighted = relu_log * inputs['attention_mask'].unsqueeze(-1)
+                sparse_vec = self.torch.max(weighted, dim=1).values.squeeze()
+
+            # 0이 아닌 값만 딕셔너리로 저장
+            sparse_dict = {}
+            indices = self.torch.nonzero(sparse_vec).squeeze(-1)
+            for idx in indices:
+                idx = idx.item()
+                token = self.tokenizer.decode([idx])
+                weight = sparse_vec[idx].item()
+                if weight > 0.1:  # 임계값 이상만 저장
+                    sparse_dict[token] = weight
+
+            sparse_vectors.append(sparse_dict)
+
+        return sparse_vectors
+
+    def compute_similarity(self, query_vec: Dict[str, float], doc_vec: Dict[str, float]) -> float:
+        """쿼리와 문서 스파스 벡터의 유사도 계산 (내적)"""
+        score = 0.0
+        for token, weight in query_vec.items():
+            if token in doc_vec:
+                score += weight * doc_vec[token]
+        return score
+
+
 # ==================== Hybrid Search 시스템 ====================
 class HybridSearchSystem:
-    """Sparse (BM25) + Dense (Semantic) + Hybrid 검색 시스템"""
+    """Sparse (BM25/SPLADE) + Dense (Semantic) + Hybrid 검색 시스템"""
 
-    def __init__(self, rag_system: RAGSystem):
+    def __init__(self, rag_system: RAGSystem, sparse_method: str = 'bm25'):
+        """
+        Args:
+            rag_system: RAG 시스템
+            sparse_method: 'bm25' 또는 'splade'
+        """
         from rank_bm25 import BM25Okapi
         import numpy as np
 
         self.rag = rag_system
         self.chunks = rag_system.get_all_chunks()
         self.np = np
+        self.sparse_method = sparse_method.lower()
 
-        # 스테머 초기화
+        # 스테머 초기화 (BM25용)
         self._init_stemmer()
 
-        # BM25 인덱스 구축 (Sparse)
+        # Sparse 인덱스 구축
+        if self.sparse_method == 'splade':
+            self._init_splade()
+        else:
+            self._init_bm25()
+
+    def _init_bm25(self):
+        """BM25 인덱스 구축"""
+        from rank_bm25 import BM25Okapi
+
         print("\n🔍 BM25 인덱스 구축 중 (스테밍 적용)...")
         tokenized_corpus = [self._tokenize(chunk['content']) for chunk in self.chunks]
         self.bm25 = BM25Okapi(tokenized_corpus)
+        self.splade = None
+        self.splade_vectors = None
         print(f"✅ BM25 인덱스 구축 완료! ({len(self.chunks)} 청크)")
+
+    def _init_splade(self):
+        """SPLADE 인덱스 구축"""
+        print("\n🔍 SPLADE 인덱스 구축 중...")
+
+        try:
+            self.splade = SPLADEEncoder()
+            self.bm25 = None
+
+            # 모든 문서 인코딩
+            print(f"   📄 {len(self.chunks)}개 문서 인코딩 중...")
+            doc_texts = [chunk['content'] for chunk in self.chunks]
+
+            # 배치 처리
+            batch_size = 8
+            self.splade_vectors = []
+            for i in range(0, len(doc_texts), batch_size):
+                batch = doc_texts[i:i+batch_size]
+                vectors = self.splade.encode(batch)
+                self.splade_vectors.extend(vectors)
+                print(f"   진행: {min(i+batch_size, len(doc_texts))}/{len(doc_texts)}", end='\r')
+
+            print(f"\n✅ SPLADE 인덱스 구축 완료! ({len(self.chunks)} 청크)")
+
+        except Exception as e:
+            print(f"⚠️ SPLADE 로드 실패: {str(e)[:50]}")
+            print("   BM25로 대체합니다...")
+            self.sparse_method = 'bm25'
+            self._init_bm25()
 
     def _init_stemmer(self):
         """스테머 초기화 - Porter Stemmer 사용"""
@@ -1000,7 +1152,14 @@ class HybridSearchSystem:
         return tokens
 
     def sparse_search(self, query: str, k: int = 5) -> List[Dict]:
-        """BM25 기반 Sparse 검색 (키워드 매칭)"""
+        """Sparse 검색 (BM25 또는 SPLADE)"""
+        if self.sparse_method == 'splade' and self.splade is not None:
+            return self._splade_search(query, k)
+        else:
+            return self._bm25_search(query, k)
+
+    def _bm25_search(self, query: str, k: int = 5) -> List[Dict]:
+        """BM25 기반 검색"""
         tokenized_query = self._tokenize(query)
         scores = self.bm25.get_scores(tokenized_query)
 
@@ -1013,7 +1172,33 @@ class HybridSearchSystem:
                 'content': self.chunks[idx]['content'],
                 'source': self.chunks[idx]['source'],
                 'score': float(scores[idx]),
-                'method': 'sparse'
+                'method': 'sparse (BM25)'
+            })
+        return results
+
+    def _splade_search(self, query: str, k: int = 5) -> List[Dict]:
+        """SPLADE 기반 검색"""
+        # 쿼리 인코딩
+        query_vec = self.splade.encode([query])[0]
+
+        # 모든 문서와 유사도 계산
+        scores = []
+        for doc_vec in self.splade_vectors:
+            score = self.splade.compute_similarity(query_vec, doc_vec)
+            scores.append(score)
+
+        scores = self.np.array(scores)
+
+        # 상위 k개 인덱스
+        top_indices = self.np.argsort(scores)[::-1][:k]
+
+        results = []
+        for idx in top_indices:
+            results.append({
+                'content': self.chunks[idx]['content'],
+                'source': self.chunks[idx]['source'],
+                'score': float(scores[idx]),
+                'method': 'sparse (SPLADE)'
             })
         return results
 
@@ -1492,7 +1677,7 @@ def main():
     print("🔀 Step 6: Hybrid Search 분석")
     print("=" * 60)
 
-    hybrid_searcher = HybridSearchSystem(rag)
+    hybrid_searcher = HybridSearchSystem(rag, sparse_method=config.sparse_method)
 
     # 검색어로 3가지 검색 방식 비교
     test_query = search_query  # 원래 검색어 사용
@@ -1501,27 +1686,30 @@ def main():
 
     search_results = hybrid_searcher.compare_all(test_query, k=5, alpha=0.5)
 
-    # 결과 출력
-    print("\n🔵 Sparse Search (BM25) 결과:")
-    for i, r in enumerate(search_results['sparse'][:3], 1):
-        bm25_score = r['score']
-        source = r['source'][:50]
-        print(f"   [{i}] BM25: {bm25_score:.2f} | {source}...")
+    # Sparse 방식 이름
+    sparse_name = config.sparse_method.upper()
 
-    print("\n🔴 Dense Search (Semantic) 결과:")
+    # 결과 출력
+    print(f"\n🔵 Sparse Search ({sparse_name}) 결과:")
+    for i, r in enumerate(search_results['sparse'][:3], 1):
+        sparse_score = r['score']
+        source = r['source'][:50]
+        print(f"   [{i}] {sparse_name}: {sparse_score:.2f} | {source}...")
+
+    print(f"\n🔴 Dense Search ({config.embedding_model}) 결과:")
     for i, r in enumerate(search_results['dense'][:3], 1):
         l2_dist = r['score']
         source = r['source'][:50]
         print(f"   [{i}] L2 Dist: {l2_dist:.4f} | {source}...")
 
-    print("\n🟢 Hybrid Search 결과 (α=0.5):")
+    print(f"\n🟢 Hybrid Search 결과 ({sparse_name} + {config.embedding_model}, α=0.5):")
     for i, r in enumerate(search_results['hybrid'][:3], 1):
-        bm25_raw = r.get('sparse_score', 0)
-        bm25_norm = r.get('sparse_score_norm', 0)
+        sparse_raw = r.get('sparse_score', 0)
+        sparse_norm = r.get('sparse_score_norm', 0)
         sem_norm = r.get('dense_score_norm', 0)
         hybrid_score = r.get('hybrid_score', 0)
         source = r['source'][:50]
-        print(f"   [{i}] Hybrid: {hybrid_score:.2f} | BM25={bm25_raw:.1f}({bm25_norm:.2f}) + Semantic({sem_norm:.2f})")
+        print(f"   [{i}] Hybrid: {hybrid_score:.2f} | {sparse_name}={sparse_raw:.1f}({sparse_norm:.2f}) + Semantic({sem_norm:.2f})")
         print(f"       {source}...")
 
     # 시각화 저장
