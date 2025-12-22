@@ -14,6 +14,7 @@ import time
 import re
 from pathlib import Path
 from typing import List, Dict, Optional
+from tqdm import tqdm
 
 # .env 파일 로드
 from dotenv import load_dotenv
@@ -532,23 +533,740 @@ class PaperSearcher:
         return papers
 
 
+# ==================== 트렌드 분석 클래스 ====================
+class TrendAnalyzer:
+    """키워드 기반 연구 트렌드 분석"""
+
+    def __init__(self, api_key: str = None, email: str = None, openai_api_key: str = None):
+        self.searcher = PaperSearcher(api_key=api_key, email=email)
+        self.papers = []
+        self.trend_data = {}
+        self.openai_api_key = openai_api_key or os.getenv('OPENAI_API_KEY')
+
+    def search_papers_for_trend(self, keyword: str, max_results: int = 50, source: str = 'pubmed') -> List[Dict]:
+        """트렌드 분석을 위한 논문 검색 (더 많은 결과)"""
+        print(f"\n🔍 '{keyword}' 트렌드 분석을 위한 논문 검색 중...")
+        self.papers = self.searcher.search(keyword, source=source, max_results=max_results)
+        print(f"   📊 총 {len(self.papers)}개 논문 수집")
+        return self.papers
+
+    def analyze_publication_trend(self) -> Dict:
+        """연도별 출판 트렌드 분석"""
+        from collections import Counter
+
+        if not self.papers:
+            return {}
+
+        # 연도 추출 및 집계
+        years = []
+        for paper in self.papers:
+            pub_date = paper.get('published', '')
+            if pub_date:
+                try:
+                    year = int(pub_date[:4])
+                    if 2000 <= year <= 2030:  # 유효한 연도 범위
+                        years.append(year)
+                except:
+                    pass
+
+        year_counts = Counter(years)
+        sorted_years = sorted(year_counts.items())
+
+        self.trend_data['year_trend'] = {
+            'years': [y[0] for y in sorted_years],
+            'counts': [y[1] for y in sorted_years],
+            'total': len(years)
+        }
+
+        return self.trend_data['year_trend']
+
+    def extract_key_terms(self, top_n: int = 20) -> Dict:
+        """논문 초록에서 핵심 키워드 추출"""
+        from collections import Counter
+        import re
+
+        if not self.papers:
+            return {}
+
+        # 불용어 (영어)
+        stopwords = {
+            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+            'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been',
+            'be', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+            'could', 'should', 'may', 'might', 'can', 'this', 'that', 'these',
+            'those', 'it', 'its', 'they', 'them', 'their', 'we', 'our', 'you',
+            'your', 'i', 'me', 'my', 'he', 'she', 'his', 'her', 'which', 'who',
+            'whom', 'what', 'when', 'where', 'why', 'how', 'all', 'each', 'every',
+            'both', 'few', 'more', 'most', 'other', 'some', 'such', 'no', 'nor',
+            'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 'just',
+            'also', 'now', 'here', 'there', 'then', 'once', 'if', 'because',
+            'while', 'although', 'though', 'after', 'before', 'since', 'until',
+            'about', 'into', 'through', 'during', 'above', 'below', 'between',
+            'under', 'again', 'further', 'then', 'once', 'study', 'studies',
+            'results', 'conclusion', 'methods', 'background', 'objective',
+            'aim', 'purpose', 'introduction', 'discussion', 'however', 'thus',
+            'therefore', 'moreover', 'furthermore', 'additionally', 'including',
+            'included', 'using', 'used', 'based', 'associated', 'related',
+            'compared', 'among', 'within', 'without', 'between', 'across'
+        }
+
+        # 모든 초록에서 단어 추출
+        all_words = []
+        for paper in self.papers:
+            abstract = paper.get('abstract', '')
+            # 단어 추출 (영문자만)
+            words = re.findall(r'\b[a-zA-Z]{3,}\b', abstract.lower())
+            # 불용어 제거
+            words = [w for w in words if w not in stopwords]
+            all_words.extend(words)
+
+        # 빈도 계산
+        word_counts = Counter(all_words)
+        top_terms = word_counts.most_common(top_n)
+
+        self.trend_data['key_terms'] = {
+            'terms': [t[0] for t in top_terms],
+            'counts': [t[1] for t in top_terms]
+        }
+
+        return self.trend_data['key_terms']
+
+    def identify_emerging_topics(self) -> List[Dict]:
+        """최근 급부상하는 주제 식별"""
+        from collections import Counter, defaultdict
+        import re
+
+        if not self.papers or len(self.papers) < 5:
+            return []
+
+        # 최근 2년 vs 이전 논문 비교
+        recent_papers = []
+        older_papers = []
+
+        current_year = 2024  # 현재 연도
+        for paper in self.papers:
+            pub_date = paper.get('published', '')
+            try:
+                year = int(pub_date[:4])
+                if year >= current_year - 1:
+                    recent_papers.append(paper)
+                else:
+                    older_papers.append(paper)
+            except:
+                pass
+
+        if not recent_papers or not older_papers:
+            return []
+
+        # 불용어
+        stopwords = {
+            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+            'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'been',
+            'be', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+            'study', 'studies', 'results', 'patients', 'treatment', 'using'
+        }
+
+        def extract_terms(papers):
+            words = []
+            for paper in papers:
+                abstract = paper.get('abstract', '')
+                w = re.findall(r'\b[a-zA-Z]{4,}\b', abstract.lower())
+                words.extend([x for x in w if x not in stopwords])
+            return Counter(words)
+
+        recent_terms = extract_terms(recent_papers)
+        older_terms = extract_terms(older_papers)
+
+        # 최근에 급증한 용어 찾기
+        emerging = []
+        for term, recent_count in recent_terms.most_common(50):
+            older_count = older_terms.get(term, 0)
+            if older_count == 0:
+                growth = float('inf')
+            else:
+                growth = (recent_count / len(recent_papers)) / (older_count / len(older_papers))
+
+            if growth > 1.5 and recent_count >= 3:
+                emerging.append({
+                    'term': term,
+                    'recent_count': recent_count,
+                    'older_count': older_count,
+                    'growth_rate': growth if growth != float('inf') else 999
+                })
+
+        # 성장률 순 정렬
+        emerging.sort(key=lambda x: x['growth_rate'], reverse=True)
+        self.trend_data['emerging_topics'] = emerging[:10]
+
+        return self.trend_data['emerging_topics']
+
+    def summarize_research_content(self, keyword: str) -> Dict:
+        """연구 내용 요약 생성"""
+        if not self.papers:
+            return {}
+
+        # 1. 주요 연구 주제 추출 (제목 기반)
+        titles = [p.get('title', '') for p in self.papers[:20]]
+
+        # 2. 주요 연구 방향 파악 (초록에서 패턴 추출)
+        research_themes = {
+            'diagnosis': 0,      # 진단
+            'treatment': 0,      # 치료
+            'mechanism': 0,      # 메커니즘
+            'prevention': 0,     # 예방
+            'clinical': 0,       # 임상
+            'review': 0,         # 리뷰/개관
+            'epidemiology': 0,   # 역학
+            'genetics': 0,       # 유전학
+        }
+
+        theme_keywords = {
+            'diagnosis': ['diagnosis', 'diagnostic', 'detection', 'screening', 'biomarker'],
+            'treatment': ['treatment', 'therapy', 'therapeutic', 'drug', 'intervention', 'medication'],
+            'mechanism': ['mechanism', 'pathway', 'molecular', 'cellular', 'signaling'],
+            'prevention': ['prevention', 'preventive', 'risk factor', 'protective'],
+            'clinical': ['clinical', 'trial', 'patient', 'outcome', 'efficacy'],
+            'review': ['review', 'overview', 'comprehensive', 'systematic', 'meta-analysis'],
+            'epidemiology': ['epidemiology', 'prevalence', 'incidence', 'population'],
+            'genetics': ['genetic', 'gene', 'mutation', 'hereditary', 'genomic'],
+        }
+
+        for paper in self.papers:
+            text = (paper.get('title', '') + ' ' + paper.get('abstract', '')).lower()
+            for theme, keywords in theme_keywords.items():
+                for kw in keywords:
+                    if kw in text:
+                        research_themes[theme] += 1
+                        break
+
+        # 상위 연구 주제
+        sorted_themes = sorted(research_themes.items(), key=lambda x: x[1], reverse=True)
+        top_themes = [(t, c) for t, c in sorted_themes if c > 0][:5]
+
+        # 3. 대표 논문 선정 (최신 + 관련성) - 10개
+        representative_papers = self.papers[:10]
+
+        # 4. 연구 내용 요약 텍스트 생성
+        summary_text = self._generate_content_summary(keyword, top_themes, representative_papers)
+
+        self.trend_data['content_summary'] = {
+            'themes': top_themes,
+            'representative_papers': representative_papers,
+            'summary_text': summary_text
+        }
+
+        return self.trend_data['content_summary']
+
+    def generate_search_summary(self, keyword: str) -> Dict:
+        """검색된 논문들에 대한 간단한 요약 생성"""
+        if not self.papers:
+            return {}
+
+        # 기본 통계
+        total_papers = len(self.papers)
+
+        # 연도 범위 계산
+        years = []
+        for paper in self.papers:
+            pub_date = paper.get('published', '')
+            if pub_date:
+                try:
+                    year = int(pub_date[:4])
+                    years.append(year)
+                except:
+                    pass
+
+        year_range = f"{min(years)}-{max(years)}" if years else "N/A"
+
+        # 소스별 분류
+        sources = {}
+        for paper in self.papers:
+            src = paper.get('source', 'Unknown')
+            sources[src] = sources.get(src, 0) + 1
+
+        # AI를 사용한 검색 결과 요약 생성
+        search_summary_text = self._generate_search_overview(keyword)
+
+        self.trend_data['search_summary'] = {
+            'total_papers': total_papers,
+            'year_range': year_range,
+            'sources': sources,
+            'summary_text': search_summary_text
+        }
+
+        return self.trend_data['search_summary']
+
+    def _generate_search_overview(self, keyword: str) -> str:
+        """검색 결과에 대한 개요 요약 생성"""
+        if not self.openai_api_key or len(self.papers) < 2:
+            return self._generate_basic_search_overview(keyword)
+
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=self.openai_api_key)
+
+            print("   🔍 검색 결과 요약 생성 중...")
+
+            # 논문 제목과 초록 수집
+            paper_info = []
+            for paper in self.papers[:15]:  # 최대 15개 논문 분석
+                title = paper.get('title', '')
+                abstract = paper.get('abstract', '')[:300]
+                paper_info.append(f"제목: {title}\n초록: {abstract}")
+
+            combined_info = "\n\n".join(paper_info)
+
+            prompt = f"""다음은 '{keyword}' 키워드로 검색된 {len(self.papers)}개의 학술 논문 정보입니다.
+
+{combined_info}
+
+위 논문들을 분석하여 다음 형식으로 검색 결과를 요약해주세요:
+
+🔎 **검색 결과 개요**:
+('{keyword}'에 대해 어떤 논문들이 검색되었는지 2-3문장으로 설명)
+
+📑 **주요 연구 내용**:
+- (검색된 논문들이 다루는 핵심 주제 3-4가지를 bullet point로)
+
+🎯 **연구 초점**:
+(이 분야 연구자들이 주로 관심을 가지는 문제나 질문 1-2문장)
+
+한국어로 간결하고 명확하게 작성해주세요."""
+
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "당신은 학술 논문 검색 결과를 분석하고 요약하는 전문가입니다."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=500,
+                temperature=0.3
+            )
+
+            summary = response.choices[0].message.content.strip()
+            print("   ✅ 검색 결과 요약 완료!")
+            return summary
+
+        except Exception as e:
+            print(f"   ⚠️ AI 요약 실패: {str(e)[:50]}")
+            return self._generate_basic_search_overview(keyword)
+
+    def _generate_basic_search_overview(self, keyword: str) -> str:
+        """기본 검색 결과 개요 생성"""
+        if not self.papers:
+            return ""
+
+        # 제목에서 공통 주제 추출
+        title_words = []
+        for paper in self.papers[:10]:
+            title = paper.get('title', '').lower()
+            words = [w for w in title.split() if len(w) > 4 and w != keyword.lower()]
+            title_words.extend(words)
+
+        from collections import Counter
+        common_words = Counter(title_words).most_common(5)
+        common_topics = [w[0] for w in common_words]
+
+        summary = f"'{keyword}' 검색 결과, 총 {len(self.papers)}개의 논문이 발견되었습니다.\n"
+        if common_topics:
+            summary += f"주요 관련 주제: {', '.join(common_topics[:3])}"
+
+        return summary
+
+    def _generate_content_summary(self, keyword: str, themes: List, papers: List) -> str:
+        """연구 내용 요약 텍스트 생성"""
+        # OpenAI API가 있으면 AI 요약 사용
+        if self.openai_api_key and len(self.papers) >= 3:
+            ai_summary = self._generate_ai_summary(keyword)
+            if ai_summary:
+                return ai_summary
+
+        # 기본 요약 생성
+        summary_parts = []
+
+        # 주요 연구 분야
+        if themes:
+            theme_names = {
+                'diagnosis': '진단/검출',
+                'treatment': '치료/약물',
+                'mechanism': '메커니즘/경로',
+                'prevention': '예방/위험요인',
+                'clinical': '임상연구',
+                'review': '종합리뷰',
+                'epidemiology': '역학연구',
+                'genetics': '유전학연구'
+            }
+            main_themes = [theme_names.get(t[0], t[0]) for t in themes[:3]]
+            summary_parts.append(f"'{keyword}' 연구는 주로 {', '.join(main_themes)} 분야에 집중되어 있습니다.")
+
+        # 최신 연구 동향
+        if papers:
+            recent_titles = [p.get('title', '')[:80] for p in papers[:3]]
+            summary_parts.append(f"\n최근 주요 연구: ")
+            for i, title in enumerate(recent_titles, 1):
+                summary_parts.append(f"  {i}. {title}...")
+
+        return "\n".join(summary_parts)
+
+    def _generate_ai_summary(self, keyword: str) -> Optional[str]:
+        """OpenAI를 사용한 AI 요약 생성"""
+        if not self.openai_api_key:
+            return None
+
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=self.openai_api_key)
+
+            print("   🤖 OpenAI GPT를 사용하여 연구 내용 분석 중...")
+
+            # 논문 초록 수집 (최대 10개로 확대)
+            abstracts = []
+            for paper in self.papers[:10]:
+                title = paper.get('title', '')
+                abstract = paper.get('abstract', '')[:600]
+                year = paper.get('published', '')[:4]
+                authors = paper.get('authors', '')[:50] if paper.get('authors') else ''
+                abstracts.append(f"[{year}] {title}\n저자: {authors}\n초록: {abstract}")
+
+            combined_text = "\n\n---\n\n".join(abstracts)
+
+            # 연도별 통계 정보 추가
+            year_stats = ""
+            if 'year_trend' in self.trend_data:
+                years = self.trend_data['year_trend']['years'][-5:]
+                counts = self.trend_data['year_trend']['counts'][-5:]
+                year_stats = f"\n\n연도별 논문 수: " + ", ".join([f"{y}년: {c}편" for y, c in zip(years, counts)])
+
+            prompt = f"""당신은 의학/과학 연구 동향 분석 전문가입니다. 다음은 '{keyword}'에 관한 최근 연구 논문들입니다.
+
+총 분석 논문 수: {len(self.papers)}편{year_stats}
+
+=== 논문 목록 ===
+{combined_text}
+
+위 연구들을 종합적으로 분석하여 '{keyword}' 분야의 연구 동향을 다음 형식으로 요약해주세요:
+
+📌 **연구 개요**: (이 분야가 무엇을 다루는지 1-2문장)
+
+🔬 **주요 연구 방향**:
+- (최근 연구들이 집중하는 핵심 주제 2-3가지)
+
+💡 **핵심 발견/결과**:
+- (주요 연구 결과나 발견 2-3가지)
+
+🔮 **향후 전망**:
+- (연구 트렌드 및 향후 방향 1-2문장)
+
+한국어로 명확하고 구체적으로 작성해주세요. 전문 용어는 필요시 간단한 설명을 추가해주세요."""
+
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "당신은 의학/과학 연구 동향을 분석하는 전문가입니다. 복잡한 연구 내용을 명확하고 이해하기 쉽게 요약합니다."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=800,
+                temperature=0.3
+            )
+
+            summary = response.choices[0].message.content.strip()
+            print("   ✅ AI 요약 생성 완료!")
+            return summary
+
+        except Exception as e:
+            print(f"   ⚠️ AI 요약 생성 실패: {str(e)[:80]}")
+            print("   📝 기본 요약으로 대체합니다...")
+            return None
+
+    def visualize_trends(self, keyword: str, save_path: str = None) -> str:
+        """트렌드 시각화"""
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        try:
+            plt.rcParams['font.family'] = 'AppleGothic'
+        except:
+            plt.rcParams['font.family'] = 'DejaVu Sans'
+        plt.rcParams['axes.unicode_minus'] = False
+
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        fig.suptitle(f'📈 Research Trend Analysis: "{keyword}"',
+                    fontsize=14, fontweight='bold')
+
+        # 1. 연도별 출판 트렌드
+        ax1 = axes[0, 0]
+        if 'year_trend' in self.trend_data:
+            years = self.trend_data['year_trend']['years']
+            counts = self.trend_data['year_trend']['counts']
+            colors = plt.cm.Blues([0.3 + 0.7 * i / len(years) for i in range(len(years))])
+            bars = ax1.bar(years, counts, color=colors, edgecolor='navy', alpha=0.8)
+            ax1.set_xlabel('Year', fontweight='bold')
+            ax1.set_ylabel('Number of Publications', fontweight='bold')
+            ax1.set_title('📅 Publication Trend by Year', fontweight='bold')
+            ax1.set_xticks(years)
+            ax1.tick_params(axis='x', rotation=45)
+            for bar, count in zip(bars, counts):
+                ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
+                        str(count), ha='center', va='bottom', fontsize=9)
+
+        # 2. 핵심 키워드
+        ax2 = axes[0, 1]
+        if 'key_terms' in self.trend_data:
+            terms = self.trend_data['key_terms']['terms'][:10]
+            term_counts = self.trend_data['key_terms']['counts'][:10]
+            colors = plt.cm.Greens([0.3 + 0.7 * i / len(terms) for i in range(len(terms))])
+            bars = ax2.barh(terms[::-1], term_counts[::-1], color=colors[::-1], edgecolor='darkgreen', alpha=0.8)
+            ax2.set_xlabel('Frequency', fontweight='bold')
+            ax2.set_title('🔑 Top Keywords in Abstracts', fontweight='bold')
+            for bar, count in zip(bars, term_counts[::-1]):
+                ax2.text(bar.get_width() + 0.5, bar.get_y() + bar.get_height()/2,
+                        str(count), va='center', fontsize=9)
+
+        # 3. 급부상 주제
+        ax3 = axes[1, 0]
+        if 'emerging_topics' in self.trend_data and self.trend_data['emerging_topics']:
+            emerging = self.trend_data['emerging_topics'][:8]
+            e_terms = [e['term'] for e in emerging]
+            e_growth = [min(e['growth_rate'], 10) for e in emerging]  # 최대 10으로 제한
+            colors = plt.cm.Reds([0.3 + 0.7 * i / len(e_terms) for i in range(len(e_terms))])
+            bars = ax3.barh(e_terms[::-1], e_growth[::-1], color=colors[::-1], edgecolor='darkred', alpha=0.8)
+            ax3.set_xlabel('Growth Rate', fontweight='bold')
+            ax3.set_title('🚀 Emerging Topics (Recent vs Older)', fontweight='bold')
+            for bar, growth in zip(bars, e_growth[::-1]):
+                ax3.text(bar.get_width() + 0.1, bar.get_y() + bar.get_height()/2,
+                        f'{growth:.1f}x', va='center', fontsize=9)
+        else:
+            ax3.text(0.5, 0.5, 'Not enough data\nfor trend analysis',
+                    ha='center', va='center', fontsize=12, transform=ax3.transAxes)
+            ax3.set_title('🚀 Emerging Topics', fontweight='bold')
+
+        # 4. 요약 정보
+        ax4 = axes[1, 1]
+        ax4.axis('off')
+
+        summary = f"📊 Trend Analysis Summary\n{'='*40}\n\n"
+        summary += f"🔍 Keyword: {keyword}\n"
+        summary += f"📄 Total Papers: {len(self.papers)}\n\n"
+
+        if 'year_trend' in self.trend_data:
+            years = self.trend_data['year_trend']['years']
+            counts = self.trend_data['year_trend']['counts']
+            if years:
+                summary += f"📅 Year Range: {min(years)} - {max(years)}\n"
+                max_idx = counts.index(max(counts))
+                summary += f"📈 Peak Year: {years[max_idx]} ({counts[max_idx]} papers)\n\n"
+
+        if 'key_terms' in self.trend_data:
+            top_5 = self.trend_data['key_terms']['terms'][:5]
+            summary += f"🔑 Top Keywords:\n"
+            for i, term in enumerate(top_5, 1):
+                summary += f"   {i}. {term}\n"
+
+        if 'emerging_topics' in self.trend_data and self.trend_data['emerging_topics']:
+            summary += f"\n🚀 Emerging Topics:\n"
+            for i, e in enumerate(self.trend_data['emerging_topics'][:3], 1):
+                summary += f"   {i}. {e['term']} ({e['growth_rate']:.1f}x growth)\n"
+
+        ax4.text(0.05, 0.95, summary, transform=ax4.transAxes, fontsize=10,
+                verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle='round,pad=0.5', facecolor='lightyellow',
+                         alpha=0.9, edgecolor='orange'))
+
+        plt.tight_layout()
+
+        if save_path is None:
+            save_path = f"trend_analysis_{keyword.replace(' ', '_')[:20]}.png"
+
+        plt.savefig(save_path, dpi=100, bbox_inches='tight',
+                   facecolor='white', edgecolor='none')
+        plt.close(fig)
+
+        print(f"   📊 트렌드 시각화 저장: {save_path}")
+        return save_path
+
+    def generate_trend_report(self, keyword: str) -> str:
+        """트렌드 분석 리포트 생성"""
+        report = []
+        report.append("\n" + "=" * 60)
+        report.append(f"📈 '{keyword}' 연구 트렌드 분석 리포트")
+        report.append("=" * 60)
+
+        report.append(f"\n📊 분석 대상: {len(self.papers)}개 논문\n")
+
+        # 검색 결과 요약
+        if 'search_summary' in self.trend_data and self.trend_data['search_summary']:
+            search_data = self.trend_data['search_summary']
+            report.append("-" * 60)
+            report.append("🔍 검색 결과 요약")
+            report.append("-" * 60)
+
+            # 기본 통계
+            report.append(f"\n   📚 검색된 논문: {search_data.get('total_papers', 0)}개")
+            report.append(f"   📅 연도 범위: {search_data.get('year_range', 'N/A')}")
+
+            # 소스별 분류
+            sources = search_data.get('sources', {})
+            if sources:
+                source_str = ", ".join([f"{k}: {v}개" for k, v in sources.items()])
+                report.append(f"   📖 출처: {source_str}")
+
+            # 요약 텍스트
+            summary_text = search_data.get('summary_text', '')
+            if summary_text:
+                report.append("\n" + "-" * 40)
+                summary_lines = summary_text.split('\n')
+                for line in summary_lines:
+                    if line.strip():
+                        report.append(f"   {line}")
+            report.append("")
+
+        # 연도별 트렌드
+        if 'year_trend' in self.trend_data:
+            years = self.trend_data['year_trend']['years']
+            counts = self.trend_data['year_trend']['counts']
+            if years:
+                report.append("📅 연도별 출판 동향:")
+                for year, count in zip(years[-5:], counts[-5:]):  # 최근 5년
+                    bar = "█" * (count * 2)
+                    report.append(f"   {year}: {bar} ({count})")
+
+                # 트렌드 분석
+                if len(counts) >= 2:
+                    recent_avg = sum(counts[-2:]) / 2
+                    older_avg = sum(counts[:-2]) / max(len(counts) - 2, 1) if len(counts) > 2 else counts[0]
+                    if recent_avg > older_avg * 1.2:
+                        report.append(f"\n   📈 트렌드: 상승세 (최근 연구 증가)")
+                    elif recent_avg < older_avg * 0.8:
+                        report.append(f"\n   📉 트렌드: 하락세 (연구 관심 감소)")
+                    else:
+                        report.append(f"\n   ➡️ 트렌드: 안정적 (꾸준한 연구)")
+
+        # 핵심 키워드
+        if 'key_terms' in self.trend_data:
+            report.append("\n🔑 핵심 키워드 (Top 10):")
+            terms = self.trend_data['key_terms']['terms'][:10]
+            counts = self.trend_data['key_terms']['counts'][:10]
+            for i, (term, count) in enumerate(zip(terms, counts), 1):
+                report.append(f"   {i:2d}. {term} ({count}회)")
+
+        # 급부상 주제
+        if 'emerging_topics' in self.trend_data and self.trend_data['emerging_topics']:
+            report.append("\n🚀 급부상 주제 (최근 vs 과거):")
+            for i, e in enumerate(self.trend_data['emerging_topics'][:5], 1):
+                growth = e['growth_rate']
+                if growth == 999:
+                    growth_str = "NEW!"
+                else:
+                    growth_str = f"{growth:.1f}x"
+                report.append(f"   {i}. {e['term']} - {growth_str} 성장")
+
+        # 연구 내용 요약
+        if 'content_summary' in self.trend_data and self.trend_data['content_summary']:
+            summary_data = self.trend_data['content_summary']
+            report.append("\n" + "-" * 60)
+            report.append("📋 연구 내용 요약")
+            report.append("-" * 60)
+
+            # 주요 연구 주제
+            if 'themes' in summary_data and summary_data['themes']:
+                theme_names = {
+                    'diagnosis': '진단/검출',
+                    'treatment': '치료/약물',
+                    'mechanism': '메커니즘/경로',
+                    'prevention': '예방/위험요인',
+                    'clinical': '임상연구',
+                    'review': '종합리뷰',
+                    'epidemiology': '역학연구',
+                    'genetics': '유전학연구'
+                }
+                report.append("\n🔬 주요 연구 분야:")
+                for theme, count in summary_data['themes'][:5]:
+                    theme_name = theme_names.get(theme, theme)
+                    bar = "▓" * min(count, 20)
+                    report.append(f"   • {theme_name}: {bar} ({count}편)")
+
+            # 요약 텍스트
+            if 'summary_text' in summary_data and summary_data['summary_text']:
+                report.append("\n📝 연구 동향 요약:")
+                summary_lines = summary_data['summary_text'].split('\n')
+                for line in summary_lines:
+                    if line.strip():
+                        report.append(f"   {line}")
+
+            # 대표 논문 (최근 10개)
+            if 'representative_papers' in summary_data and summary_data['representative_papers']:
+                report.append("\n📚 대표 논문 (최근 10개):")
+                report.append("-" * 50)
+                for i, paper in enumerate(summary_data['representative_papers'][:10], 1):
+                    title = paper.get('title', '')[:65]
+                    year = paper.get('published', paper.get('year', 'N/A'))[:4] if paper.get('published') or paper.get('year') else 'N/A'
+                    authors = paper.get('authors', [])
+                    if isinstance(authors, list):
+                        author_str = ', '.join(authors[:2])
+                        if len(authors) > 2:
+                            author_str += ' et al.'
+                    else:
+                        author_str = str(authors)[:40]
+                    source = paper.get('source', '')
+
+                    report.append(f"\n   [{i:2d}] {title}...")
+                    report.append(f"       📅 {year} | 👤 {author_str}")
+                    if source:
+                        report.append(f"       📖 {source}")
+
+        report.append("\n" + "=" * 60)
+
+        return "\n".join(report)
+
+    def analyze(self, keyword: str, max_results: int = 50, source: str = 'pubmed') -> str:
+        """전체 트렌드 분석 실행"""
+        # 1. 논문 검색
+        self.search_papers_for_trend(keyword, max_results, source)
+
+        if not self.papers:
+            return f"❌ '{keyword}'에 대한 논문을 찾을 수 없습니다."
+
+        # 2. 검색 결과 요약 생성
+        print("\n📋 검색 결과 분석 중...")
+        self.generate_search_summary(keyword)
+
+        # 3. 분석 수행
+        print("📊 트렌드 분석 중...")
+        self.analyze_publication_trend()
+        self.extract_key_terms()
+        self.identify_emerging_topics()
+
+        # 4. 연구 내용 요약 생성
+        print("📝 연구 내용 요약 생성 중...")
+        self.summarize_research_content(keyword)
+
+        # 5. 시각화
+        print("📈 시각화 생성 중...")
+        self.visualize_trends(keyword)
+
+        # 6. 리포트 생성
+        report = self.generate_trend_report(keyword)
+        print(report)
+
+        return report
+
+
 # ==================== PDFDownloader 클래스 ====================
 class PDFDownloader:
     def __init__(self, save_dir: str = PAPERS_DIR):
         self.save_dir = save_dir
         os.makedirs(save_dir, exist_ok=True)
 
-    def download(self, paper: Dict) -> Optional[str]:
+    def download(self, paper: Dict, show_progress: bool = True) -> Optional[str]:
         safe_title = re.sub(r'[^\w\s-]', '', paper['title'])[:50]
         filename = f"{paper['id']}_{safe_title}.pdf"
         filepath = os.path.join(self.save_dir, filename)
         txt_filepath = filepath.replace('.pdf', '.txt')
 
         if os.path.exists(txt_filepath):
-            print(f"   ⏭️ 이미 존재: {os.path.basename(txt_filepath)[:40]}...")
             return txt_filepath
         if os.path.exists(filepath):
-            print(f"   ⏭️ 이미 존재: {filename[:40]}...")
             return filepath
 
         pdf_url = paper.get('pdf_url') or paper.get('pmc_url')
@@ -556,26 +1274,55 @@ class PDFDownloader:
         if not pdf_url:
             if paper['source'] == 'PubMed':
                 return self._save_abstract_as_text(paper, filename)
-            print(f"   ⚠️ PDF URL 없음: {paper['title'][:40]}...")
             return None
 
         try:
             headers = {'User-Agent': 'Mozilla/5.0 (compatible; ResearchBot/1.0)'}
-            response = requests.get(pdf_url, headers=headers, timeout=60)
+            response = requests.get(pdf_url, headers=headers, timeout=60, stream=True)
             response.raise_for_status()
 
-            if response.content[:5] == b'<html' or response.content[:5] == b'<!DOC':
-                print(f"   ⚠️ PDF 접근 불가, 초록 저장: {paper['title'][:30]}...")
+            # Content-Type 확인
+            content_type = response.headers.get('content-type', '')
+            if 'html' in content_type or 'text' in content_type:
                 return self._save_abstract_as_text(paper, filename)
 
-            with open(filepath, 'wb') as f:
-                f.write(response.content)
+            # 파일 크기 확인
+            total_size = int(response.headers.get('content-length', 0))
 
-            print(f"   ✅ 다운로드: {filename[:40]}...")
+            # 처음 몇 바이트로 HTML 여부 확인
+            first_chunk = next(response.iter_content(chunk_size=5), b'')
+            if first_chunk.startswith(b'<html') or first_chunk.startswith(b'<!DOC'):
+                return self._save_abstract_as_text(paper, filename)
+
+            # 스트리밍 다운로드 with 진행 바
+            with open(filepath, 'wb') as f:
+                f.write(first_chunk)  # 첫 청크 기록
+
+                if show_progress and total_size > 0:
+                    # 진행 바 표시
+                    with tqdm(
+                        total=total_size,
+                        initial=len(first_chunk),
+                        unit='B',
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        desc=f"   📥 {filename[:30]}",
+                        bar_format='{desc}: {percentage:3.0f}%|{bar:20}| {n_fmt}/{total_fmt} [{rate_fmt}]',
+                        leave=False
+                    ) as pbar:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                                pbar.update(len(chunk))
+                else:
+                    # 진행 바 없이 다운로드
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+
             return filepath
 
         except Exception as e:
-            print(f"   ⚠️ PDF 다운로드 실패, 초록 저장: {paper['title'][:30]}...")
             return self._save_abstract_as_text(paper, filename)
 
     def _save_abstract_as_text(self, paper: Dict, filename: str) -> Optional[str]:
@@ -603,16 +1350,70 @@ URL: {paper.get('pubmed_url', paper.get('pdf_url', 'N/A'))}
         return filepath
 
     def download_all(self, papers: List[Dict]) -> List[str]:
-        print("\n📥 논문 다운로드 시작...\n")
+        total = len(papers)
+        if total == 0:
+            print("   ⚠️ 다운로드할 논문이 없습니다.")
+            return []
+
+        print("\n" + "=" * 60)
+        print("📥 논문 다운로드")
+        print("=" * 60)
+        print(f"   총 {total}개 논문 다운로드 예정\n")
 
         downloaded = []
-        for paper in papers:
-            filepath = self.download(paper)
-            if filepath:
-                downloaded.append(filepath)
-            time.sleep(0.3)
+        skipped = 0
+        pdf_count = 0
+        abstract_count = 0
+        failed = 0
 
-        print(f"\n📁 총 {len(downloaded)}개 파일 다운로드 완료!")
+        # 전체 진행 상황 바
+        with tqdm(
+            total=total,
+            desc="   📚 전체 진행",
+            bar_format='{desc}: {percentage:3.0f}%|{bar:30}| {n}/{total} [{elapsed}<{remaining}]',
+            colour='green'
+        ) as pbar:
+            for i, paper in enumerate(papers):
+                title = paper.get('title', 'Unknown')[:35]
+
+                # 이미 존재하는지 확인
+                safe_title = re.sub(r'[^\w\s-]', '', paper['title'])[:50]
+                filename = f"{paper['id']}_{safe_title}.pdf"
+                filepath = os.path.join(self.save_dir, filename)
+                txt_filepath = filepath.replace('.pdf', '.txt')
+
+                if os.path.exists(txt_filepath) or os.path.exists(filepath):
+                    skipped += 1
+                    pbar.set_postfix_str(f"⏭️ 스킵: {title}...")
+                    downloaded.append(txt_filepath if os.path.exists(txt_filepath) else filepath)
+                else:
+                    pbar.set_postfix_str(f"📥 {title}...")
+                    result_path = self.download(paper, show_progress=False)
+
+                    if result_path:
+                        downloaded.append(result_path)
+                        if result_path.endswith('.pdf'):
+                            pdf_count += 1
+                        else:
+                            abstract_count += 1
+                    else:
+                        failed += 1
+
+                pbar.update(1)
+                time.sleep(0.2)
+
+        # 다운로드 결과 요약
+        print("\n" + "-" * 60)
+        print("📊 다운로드 결과 요약")
+        print("-" * 60)
+        print(f"   ✅ 총 다운로드: {len(downloaded)}개")
+        print(f"      📄 PDF 파일: {pdf_count}개")
+        print(f"      📝 초록 저장: {abstract_count}개")
+        print(f"      ⏭️ 기존 파일: {skipped}개")
+        if failed > 0:
+            print(f"      ❌ 실패: {failed}개")
+        print("-" * 60)
+
         return downloaded
 
 
@@ -2213,12 +3014,96 @@ def interactive_qa(rag: RAGSystem, openai_api_key: str = None):
             print(f"❌ Error: {str(e)}")
 
 
+# ==================== 트렌드 분석 실행 ====================
+def run_trend_analysis():
+    """트렌드 분석 모드 실행"""
+    print("\n" + "=" * 60)
+    print("📈 연구 트렌드 분석")
+    print("=" * 60)
+
+    # .env에서 API 키 로드
+    pubmed_api_key = os.getenv('PUBMED_API_KEY')
+    pubmed_email = os.getenv('PUBMED_EMAIL')
+    openai_api_key = os.getenv('OPENAI_API_KEY')
+
+    if openai_api_key:
+        print("   ✅ OpenAI API 연결됨 - AI 요약 기능 활성화")
+    else:
+        print("   ⚠️ OpenAI API 미설정 - 기본 요약 사용")
+
+    # 검색 소스 선택
+    print("\n📖 검색 소스 선택:")
+    print("   1. PubMed (의학/생물학) [기본값]")
+    print("   2. arXiv (CS/물리/수학)")
+    print("   3. 둘 다")
+    source_choice = input("선택 [1]: ").strip() or "1"
+    source = {'1': 'pubmed', '2': 'arxiv', '3': 'both'}.get(source_choice, 'pubmed')
+
+    # 키워드 입력
+    keyword = input("\n🔍 분석할 키워드 입력: ").strip()
+    if not keyword:
+        keyword = "diabetes treatment"
+        print(f"   기본값 사용: {keyword}")
+
+    # 언어 감지 및 번역
+    if detect_language(keyword) == 'ko':
+        openai_api_key = os.getenv('OPENAI_API_KEY')
+        print("\n🔄 한국어 키워드를 영어로 번역 중...")
+        keyword_en = translate_to_english(keyword, openai_api_key)
+        print(f"   🇰🇷 원본: {keyword}")
+        print(f"   🇺🇸 번역: {keyword_en}")
+        keyword = keyword_en
+
+    # 논문 수 설정
+    max_results = input("\n📄 분석할 최대 논문 수 [50]: ").strip()
+    max_results = int(max_results) if max_results.isdigit() else 50
+
+    print("\n" + "-" * 60)
+    print("✅ 트렌드 분석 설정 완료!")
+    print(f"   🔍 키워드: {keyword}")
+    print(f"   📖 소스: {source}")
+    print(f"   📄 최대 논문: {max_results}")
+    print("-" * 60)
+
+    # 트렌드 분석 실행
+    analyzer = TrendAnalyzer(api_key=pubmed_api_key, email=pubmed_email, openai_api_key=openai_api_key)
+    analyzer.analyze(keyword, max_results=max_results, source=source)
+
+    # 추가 분석 여부
+    while True:
+        another = input("\n🔄 다른 키워드 분석? (y/n) [n]: ").strip().lower()
+        if another == 'y':
+            keyword = input("🔍 새 키워드 입력: ").strip()
+            if keyword:
+                if detect_language(keyword) == 'ko':
+                    keyword = translate_to_english(keyword, os.getenv('OPENAI_API_KEY'))
+                    print(f"   🇺🇸 번역: {keyword}")
+                analyzer.analyze(keyword, max_results=max_results, source=source)
+        else:
+            break
+
+    print("\n" + "=" * 60)
+    print("✅ 트렌드 분석 종료!")
+    print("=" * 60)
+
+
 # ==================== 메인 실행 ====================
 def main():
     print("=" * 60)
     print("🚀 Medical/Scientific Paper RAG System")
     print("   with Paper Summarization & Multilingual Support")
     print("=" * 60)
+
+    # 메인 메뉴
+    print("\n📋 기능 선택:")
+    print("   1. RAG 시스템 (논문 검색 + 질의응답)")
+    print("   2. 트렌드 분석 (키워드 기반 연구 동향)")
+    mode = input("선택 [1]: ").strip() or "1"
+
+    if mode == "2":
+        # 트렌드 분석 모드
+        run_trend_analysis()
+        return
 
     # 1. 대화형 설정
     config = Config().interactive_setup()
