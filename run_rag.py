@@ -1502,23 +1502,18 @@ class QdrantHybridSearch:
         sparse_method: str = 'BM25',
         dense_model: str = 'Dense',
         save_path: str = None,
-        show_plot: bool = True
+        show_plot: bool = False
     ) -> str:
-        """Qdrant 검색 결과 시각화"""
-        import matplotlib.pyplot as plt
+        """Qdrant 검색 결과 시각화 (파일 저장)"""
         import matplotlib
-
-        # 대화형 백엔드 사용 (show_plot이 True일 때)
-        if show_plot:
-            try:
-                matplotlib.use('TkAgg')
-            except:
-                matplotlib.use('Agg')
-        else:
-            matplotlib.use('Agg')
+        matplotlib.use('Agg')  # 비대화형 백엔드 (빠르고 안정적)
+        import matplotlib.pyplot as plt
 
         # 한글 폰트 설정
-        plt.rcParams['font.family'] = ['AppleGothic', 'DejaVu Sans']
+        try:
+            plt.rcParams['font.family'] = 'AppleGothic'
+        except:
+            plt.rcParams['font.family'] = 'DejaVu Sans'
         plt.rcParams['axes.unicode_minus'] = False
 
         fig, axes = plt.subplots(2, 2, figsize=(15, 11))
@@ -1631,19 +1626,11 @@ class QdrantHybridSearch:
         if save_path is None:
             save_path = f"qdrant_hybrid_search_{query[:20].replace(' ', '_')}.png"
 
-        plt.savefig(save_path, dpi=150, bbox_inches='tight',
+        plt.savefig(save_path, dpi=100, bbox_inches='tight',
                    facecolor='white', edgecolor='none')
-        print(f"\n📊 시각화 저장: {save_path}")
+        plt.close(fig)  # 명시적으로 figure 닫기
 
-        # 그래프 표시
-        if show_plot:
-            try:
-                plt.show()
-                print("   ✅ 그래프 창이 열렸습니다. 창을 닫으면 계속 진행됩니다.")
-            except Exception as e:
-                print(f"   ⚠️ 대화형 표시 실패: {e}")
-
-        plt.close()
+        print(f"   📊 시각화 저장 완료: {save_path}")
         return save_path
 
 
@@ -1987,22 +1974,17 @@ class HybridSearchSystem:
         }
 
     def visualize_comparison(self, query: str, k: int = 5, alpha: float = 0.5,
-                            save_path: str = None, show_plot: bool = True) -> None:
-        """검색 결과 시각화"""
-        import matplotlib.pyplot as plt
+                            save_path: str = None) -> None:
+        """검색 결과 시각화 (파일 저장)"""
         import matplotlib
-
-        # 대화형 백엔드 사용 (show_plot이 True일 때)
-        if show_plot:
-            try:
-                matplotlib.use('TkAgg')
-            except:
-                matplotlib.use('Agg')
-        else:
-            matplotlib.use('Agg')
+        matplotlib.use('Agg')  # 비대화형 백엔드 (빠르고 안정적)
+        import matplotlib.pyplot as plt
 
         # 한글 폰트 설정
-        plt.rcParams['font.family'] = ['AppleGothic', 'DejaVu Sans']
+        try:
+            plt.rcParams['font.family'] = 'AppleGothic'
+        except:
+            plt.rcParams['font.family'] = 'DejaVu Sans'
         plt.rcParams['axes.unicode_minus'] = False
 
         results = self.compare_all(query, k, alpha)
@@ -2096,20 +2078,11 @@ class HybridSearchSystem:
         if save_path is None:
             save_path = f"./hybrid_search_comparison.png"
 
-        plt.savefig(save_path, dpi=150, bbox_inches='tight',
+        plt.savefig(save_path, dpi=100, bbox_inches='tight',
                    facecolor='white', edgecolor='none')
-        print(f"\n📊 시각화 저장 완료: {save_path}")
+        plt.close(fig)  # 명시적으로 figure 닫기
 
-        # 그래프 표시
-        if show_plot:
-            try:
-                plt.show()
-                print("   ✅ 그래프 창이 열렸습니다. 창을 닫으면 계속 진행됩니다.")
-            except Exception as e:
-                print(f"   ⚠️ 대화형 표시 실패: {e}")
-
-        plt.close()
-
+        print(f"   📊 시각화 저장 완료: {save_path}")
         return results
 
 
@@ -2413,7 +2386,7 @@ def main():
         for i, r in enumerate(filtered_results[:3], 1):
             print(f"   [{i}] {r['source'][:50]}...")
 
-        # 시각화 생성 및 표시
+        # 시각화 생성
         print("\n📊 시각화 생성 중...")
         qdrant_search.visualize_comparison(
             query=test_query,
@@ -2422,8 +2395,7 @@ def main():
             hybrid_results=hybrid_results,
             alpha=0.7,
             sparse_method=sparse_name,
-            dense_model=config.embedding_model,
-            show_plot=True
+            dense_model=config.embedding_model
         )
 
     else:
@@ -2480,7 +2452,7 @@ def main():
 
         # 시각화 저장 및 표시
         print("\n📊 시각화 생성 중...")
-        hybrid_searcher.visualize_comparison(test_query, k=5, alpha=0.5, show_plot=True)
+        hybrid_searcher.visualize_comparison(test_query, k=5, alpha=0.5)
 
     # 9. 대화형 질의응답
     interactive_qa(rag, config.openai_api_key)
