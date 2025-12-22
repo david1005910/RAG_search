@@ -139,6 +139,9 @@ class Config:
         self.vector_db = 'faiss'  # 'faiss' 또는 'qdrant'
         self.chunk_size = 1000
         self.chunk_overlap = 200
+        # Reranking 설정
+        self.use_reranking = False
+        self.reranker_model = 'ms-marco'  # 'ms-marco', 'ms-marco-large', 'bge-reranker', 'bge-reranker-large'
         # .env 파일에서 API 키 로드
         self.pubmed_api_key = os.getenv('PUBMED_API_KEY') or None
         self.pubmed_email = os.getenv('PUBMED_EMAIL') or None
@@ -221,6 +224,25 @@ class Config:
             '2': 'qdrant'
         }.get(db_choice, 'faiss')
 
+        # Reranking 설정
+        print("\n🎯 Reranking 설정 (검색 정확도 향상):")
+        print("   1. 사용 안함 [기본값]")
+        print("   2. MS-MARCO MiniLM (빠름)")
+        print("   3. MS-MARCO MiniLM Large (정확)")
+        print("   4. BGE Reranker (다국어)")
+        print("   5. BGE Reranker Large (고정확도)")
+        rerank_choice = input("선택 [1]: ").strip() or "1"
+        if rerank_choice == '1':
+            self.use_reranking = False
+        else:
+            self.use_reranking = True
+            self.reranker_model = {
+                '2': 'ms-marco',
+                '3': 'ms-marco-large',
+                '4': 'bge-reranker',
+                '5': 'bge-reranker-large'
+            }.get(rerank_choice, 'ms-marco')
+
         # PubMed API 설정
         if self.search_source in ['pubmed', 'both']:
             print("\n🔑 PubMed API 설정 (선택사항 - 속도 향상):")
@@ -262,6 +284,10 @@ class Config:
         print(f"   🧠 Dense 모델: {self.embedding_model}")
         print(f"   🔤 Sparse 방식: {self.sparse_method.upper()}")
         print(f"   🗄️ Vector DB: {self.vector_db.upper()}")
+        if self.use_reranking:
+            print(f"   🎯 Reranking: {self.reranker_model.upper()}")
+        else:
+            print(f"   🎯 Reranking: 사용 안함")
         if self.pubmed_api_key:
             print(f"   🔑 PubMed API: 설정됨")
         if self.openai_api_key:
@@ -1659,6 +1685,163 @@ class OpenAIEmbeddings(Embeddings):
         return response.data[0].embedding
 
 
+# ==================== Reranker 클래스 ====================
+class Reranker:
+    """Cross-Encoder 기반 Reranking 모델"""
+
+    MODELS = {
+        'ms-marco': {
+            'name': 'cross-encoder/ms-marco-MiniLM-L-6-v2',
+            'description': 'MS MARCO 학습 (빠름, 일반용)',
+        },
+        'ms-marco-large': {
+            'name': 'cross-encoder/ms-marco-MiniLM-L-12-v2',
+            'description': 'MS MARCO 학습 (정확, 일반용)',
+        },
+        'bge-reranker': {
+            'name': 'BAAI/bge-reranker-base',
+            'description': 'BGE Reranker (다국어 지원)',
+        },
+        'bge-reranker-large': {
+            'name': 'BAAI/bge-reranker-large',
+            'description': 'BGE Reranker Large (고정확도)',
+        },
+    }
+
+    def __init__(self, model_type: str = 'ms-marco', device: str = None):
+        """
+        Reranker 초기화
+
+        Args:
+            model_type: 모델 타입 ('ms-marco', 'ms-marco-large', 'bge-reranker', 'bge-reranker-large')
+            device: 'cuda', 'mps', 'cpu' 또는 None (자동 감지)
+        """
+        import torch
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+        if device is None:
+            if torch.cuda.is_available():
+                device = 'cuda'
+            elif torch.backends.mps.is_available():
+                device = 'mps'
+            else:
+                device = 'cpu'
+
+        self.device = device
+        self.model_type = model_type
+
+        model_info = self.MODELS.get(model_type, self.MODELS['ms-marco'])
+        model_name = model_info['name']
+
+        print(f"   🔄 Reranker 모델 로딩: {model_name}")
+        print(f"   📍 Device: {device}")
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
+        self.model.to(device)
+        self.model.eval()
+
+        print(f"   ✅ Reranker 로드 완료!")
+
+    def compute_score(self, query: str, document: str) -> float:
+        """단일 쿼리-문서 쌍의 관련성 점수 계산"""
+        import torch
+
+        inputs = self.tokenizer(
+            query, document,
+            padding=True,
+            truncation=True,
+            max_length=512,
+            return_tensors='pt'
+        ).to(self.device)
+
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            # Sigmoid를 적용하여 0-1 범위로 변환
+            score = torch.sigmoid(outputs.logits).squeeze().item()
+
+        return score
+
+    def rerank(
+        self,
+        query: str,
+        documents: List[Dict],
+        top_k: int = None,
+        content_key: str = 'content',
+        show_progress: bool = True
+    ) -> List[Dict]:
+        """
+        문서 리스트 Reranking
+
+        Args:
+            query: 검색 쿼리
+            documents: 문서 리스트 (각 문서는 dict)
+            top_k: 반환할 상위 문서 수 (None이면 전체 반환)
+            content_key: 문서 dict에서 텍스트를 가져올 키
+            show_progress: 진행 바 표시 여부
+
+        Returns:
+            rerank_score가 추가된 정렬된 문서 리스트
+        """
+        import torch
+
+        if not documents:
+            return []
+
+        # 배치 처리를 위한 준비
+        pairs = [(query, doc.get(content_key, '')) for doc in documents]
+        scores = []
+
+        batch_size = 8
+
+        if show_progress and len(documents) > batch_size:
+            iterator = tqdm(
+                range(0, len(pairs), batch_size),
+                desc="   🎯 Reranking",
+                bar_format='{desc}: {percentage:3.0f}%|{bar:25}| {n}/{total} [{elapsed}<{remaining}]',
+                colour='yellow',
+                total=(len(pairs) + batch_size - 1) // batch_size
+            )
+        else:
+            iterator = range(0, len(pairs), batch_size)
+
+        for i in iterator:
+            batch_pairs = pairs[i:i+batch_size]
+
+            inputs = self.tokenizer(
+                [p[0] for p in batch_pairs],
+                [p[1] for p in batch_pairs],
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors='pt'
+            ).to(self.device)
+
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                batch_scores = torch.sigmoid(outputs.logits).squeeze(-1)
+
+                if batch_scores.dim() == 0:
+                    scores.append(batch_scores.item())
+                else:
+                    scores.extend(batch_scores.cpu().tolist())
+
+        # 결과에 rerank_score 추가
+        reranked_docs = []
+        for doc, score in zip(documents, scores):
+            doc_copy = doc.copy()
+            doc_copy['rerank_score'] = score
+            doc_copy['original_score'] = doc.get('hybrid_score', doc.get('score', 0))
+            reranked_docs.append(doc_copy)
+
+        # rerank_score로 정렬
+        reranked_docs.sort(key=lambda x: x['rerank_score'], reverse=True)
+
+        if top_k:
+            return reranked_docs[:top_k]
+        return reranked_docs
+
+
 # ==================== EmbeddingModelFactory 클래스 ====================
 class EmbeddingModelFactory:
     """임베딩 모델 팩토리 - HuggingFace 또는 OpenAI 선택 가능"""
@@ -1900,7 +2083,10 @@ class QdrantHybridSearch:
         collection_name: str = "papers",
         use_memory: bool = True,
         qdrant_url: str = None,
-        sparse_method: str = 'bm25'
+        sparse_method: str = 'bm25',
+        reranker: 'Reranker' = None,
+        use_reranking: bool = False,
+        reranker_model: str = 'ms-marco'
     ):
         from qdrant_client import QdrantClient
         from qdrant_client.models import (
@@ -1913,6 +2099,8 @@ class QdrantHybridSearch:
         self.sparse_method = sparse_method.lower()
         self.chunks = []
         self.splade_encoder = None
+        self.reranker = reranker
+        self.use_reranking = use_reranking
 
         # Qdrant 클라이언트 초기화
         if use_memory:
@@ -1921,6 +2109,11 @@ class QdrantHybridSearch:
         else:
             print(f"\n🗄️ Qdrant 서버 연결: {qdrant_url}")
             self.client = QdrantClient(url=qdrant_url)
+
+        # Reranker 초기화 (요청 시)
+        if use_reranking and self.reranker is None:
+            print("\n🎯 Reranker 초기화...")
+            self.reranker = Reranker(model_type=reranker_model)
 
         # Dense 벡터 차원 확인
         test_embedding = self.embeddings.embed_query("test")
@@ -2264,16 +2457,29 @@ class QdrantHybridSearch:
         query: str,
         k: int = 5,
         alpha: float = 0.5,
-        filter_conditions: Dict = None
+        filter_conditions: Dict = None,
+        use_reranking: bool = None,
+        rerank_top_k: int = None
     ) -> List[Dict]:
         """
-        Hybrid 검색 (Dense + Sparse)
-        alpha: 0.0 = 순수 Sparse, 1.0 = 순수 Dense
+        Hybrid 검색 (Dense + Sparse) + 선택적 Reranking
+
+        Args:
+            query: 검색 쿼리
+            k: 반환할 결과 수
+            alpha: 0.0 = 순수 Sparse, 1.0 = 순수 Dense
+            filter_conditions: 필터 조건
+            use_reranking: Reranking 사용 여부 (None이면 self.use_reranking 사용)
+            rerank_top_k: Reranking할 후보 수 (None이면 k*3)
         """
         import numpy as np
 
-        # 더 많은 후보 검색
-        num_candidates = max(k * 3, 20)
+        # Reranking 설정
+        apply_reranking = use_reranking if use_reranking is not None else self.use_reranking
+        rerank_candidates = rerank_top_k if rerank_top_k else max(k * 3, 20)
+
+        # 더 많은 후보 검색 (reranking 시 더 많이)
+        num_candidates = rerank_candidates if apply_reranking else max(k * 3, 20)
 
         dense_results = self.dense_search(query, k=num_candidates, filter_conditions=filter_conditions)
         sparse_results = self.sparse_search(query, k=num_candidates, filter_conditions=filter_conditions)
@@ -2338,8 +2544,25 @@ class QdrantHybridSearch:
                 'method': 'hybrid'
             })
 
-        # 정렬 및 반환
+        # 정렬
         results.sort(key=lambda x: x['hybrid_score'], reverse=True)
+
+        # Reranking 적용 (활성화된 경우)
+        if apply_reranking and self.reranker is not None:
+            # 상위 후보들만 reranking
+            candidates = results[:rerank_candidates]
+            reranked = self.reranker.rerank(
+                query=query,
+                documents=candidates,
+                top_k=k,
+                content_key='content',
+                show_progress=len(candidates) > 10
+            )
+            # reranked 결과에 method 업데이트
+            for r in reranked:
+                r['method'] = 'hybrid+rerank'
+            return reranked
+
         return results[:k]
 
     def search_with_filter(
@@ -2611,11 +2834,19 @@ class SPLADEEncoder:
 class HybridSearchSystem:
     """Sparse (BM25/SPLADE) + Dense (Semantic) + Hybrid 검색 시스템"""
 
-    def __init__(self, rag_system: RAGSystem, sparse_method: str = 'bm25'):
+    def __init__(
+        self,
+        rag_system: RAGSystem,
+        sparse_method: str = 'bm25',
+        use_reranking: bool = False,
+        reranker_model: str = 'ms-marco'
+    ):
         """
         Args:
             rag_system: RAG 시스템
             sparse_method: 'bm25' 또는 'splade'
+            use_reranking: Reranking 사용 여부
+            reranker_model: Reranker 모델 타입
         """
         from rank_bm25 import BM25Okapi
         import numpy as np
@@ -2624,6 +2855,13 @@ class HybridSearchSystem:
         self.chunks = rag_system.get_all_chunks()
         self.np = np
         self.sparse_method = sparse_method.lower()
+        self.use_reranking = use_reranking
+        self.reranker = None
+
+        # Reranker 초기화 (요청 시)
+        if use_reranking:
+            print("\n🎯 Reranker 초기화...")
+            self.reranker = Reranker(model_type=reranker_model)
 
         # 스테머 초기화 (BM25용)
         self._init_stemmer()
@@ -2754,14 +2992,32 @@ class HybridSearchSystem:
             r['method'] = 'dense'
         return results
 
-    def hybrid_search(self, query: str, k: int = 5, alpha: float = 0.5, rrf_k: int = 10) -> List[Dict]:
+    def hybrid_search(
+        self,
+        query: str,
+        k: int = 5,
+        alpha: float = 0.5,
+        rrf_k: int = 10,
+        use_reranking: bool = None,
+        rerank_top_k: int = None
+    ) -> List[Dict]:
         """
-        Hybrid 검색 (Sparse + Dense 결합) - RRF (Reciprocal Rank Fusion) 사용
-        alpha: 0.0 = 순수 Sparse, 1.0 = 순수 Dense
-        rrf_k: RRF 상수 (기본값 10 - 점수 범위 향상)
+        Hybrid 검색 (Sparse + Dense 결합) - RRF (Reciprocal Rank Fusion) 사용 + Reranking
+
+        Args:
+            query: 검색 쿼리
+            k: 반환할 결과 수
+            alpha: 0.0 = 순수 Sparse, 1.0 = 순수 Dense
+            rrf_k: RRF 상수 (기본값 10)
+            use_reranking: Reranking 사용 여부 (None이면 self.use_reranking)
+            rerank_top_k: Reranking할 후보 수
         """
+        # Reranking 설정
+        apply_reranking = use_reranking if use_reranking is not None else self.use_reranking
+        rerank_candidates = rerank_top_k if rerank_top_k else max(k * 3, 20)
+
         # 충분한 후보 검색
-        num_candidates = max(k * 3, 20)
+        num_candidates = rerank_candidates if apply_reranking else max(k * 3, 20)
         sparse_results = self.sparse_search(query, k=num_candidates)
         dense_results = self.dense_search(query, k=num_candidates)
 
@@ -2864,6 +3120,20 @@ class HybridSearchSystem:
 
         # Hybrid 스코어로 정렬
         results.sort(key=lambda x: x['hybrid_score'], reverse=True)
+
+        # Reranking 적용 (활성화된 경우)
+        if apply_reranking and self.reranker is not None:
+            candidates = results[:rerank_candidates]
+            reranked = self.reranker.rerank(
+                query=query,
+                documents=candidates,
+                top_k=k,
+                content_key='content',
+                show_progress=len(candidates) > 10
+            )
+            for r in reranked:
+                r['method'] = 'hybrid+rerank'
+            return reranked
 
         return results[:k]
 
