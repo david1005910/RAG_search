@@ -286,8 +286,9 @@ class PaperSummarizer:
             return papers
 
         print("\n" + "=" * 60)
-        print("📝 논문 요약 중... (OpenAI API 사용)")
+        print("📝 논문 요약 (OpenAI API)")
         print("=" * 60)
+        print(f"   📚 총 {len(papers)}개 논문 요약 예정\n")
 
         try:
             from openai import OpenAI
@@ -318,19 +319,29 @@ Follow this format:
 - Conclusion & Significance"""
 
         summarized_papers = []
+        success_count = 0
+        fail_count = 0
 
-        for i, paper in enumerate(papers):
-            print(f"\n   [{i+1}/{len(papers)}] {paper['title'][:50]}...")
+        # tqdm 진행 바로 요약 진행 상황 표시
+        with tqdm(
+            total=len(papers),
+            desc="   🤖 AI 요약 생성",
+            bar_format='{desc}: {percentage:3.0f}%|{bar:25}| {n}/{total} [{elapsed}<{remaining}]',
+            colour='cyan'
+        ) as pbar:
+            for i, paper in enumerate(papers):
+                title_short = paper['title'][:35] + "..." if len(paper['title']) > 35 else paper['title']
+                pbar.set_postfix_str(f"📄 {title_short}")
 
-            # 해당 논문의 본문 찾기
-            paper_content = ""
-            for doc in documents:
-                if paper['id'] in doc['source']:
-                    paper_content = doc['text'][:3000]  # 토큰 제한
-                    break
+                # 해당 논문의 본문 찾기
+                paper_content = ""
+                for doc in documents:
+                    if paper['id'] in doc['source']:
+                        paper_content = doc['text'][:3000]  # 토큰 제한
+                        break
 
-            # 요약할 내용 구성
-            content_to_summarize = f"""
+                # 요약할 내용 구성
+                content_to_summarize = f"""
 Title: {paper['title']}
 Authors: {', '.join(paper['authors'][:5])}
 Published: {paper['published']}
@@ -343,39 +354,61 @@ Content:
 {paper_content}
 """
 
-            try:
-                response = client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": content_to_summarize}
-                    ],
-                    max_tokens=500,
-                    temperature=0.3
-                )
+                try:
+                    response = client.chat.completions.create(
+                        model="gpt-3.5-turbo",
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": content_to_summarize}
+                        ],
+                        max_tokens=500,
+                        temperature=0.3
+                    )
 
-                summary = response.choices[0].message.content
-                paper['summary'] = summary
-                print(f"      ✅ 요약 완료")
+                    summary = response.choices[0].message.content
+                    paper['summary'] = summary
+                    success_count += 1
 
-            except Exception as e:
-                print(f"      ⚠️ 요약 실패: {str(e)[:50]}")
-                paper['summary'] = paper['abstract'][:500] + "..."
+                except Exception as e:
+                    # 실패 시 전체 초록 사용
+                    paper['summary'] = f"[초록 원문]\n{paper['abstract']}"
+                    fail_count += 1
 
-            summarized_papers.append(paper)
-            time.sleep(0.5)  # API 속도 제한
+                summarized_papers.append(paper)
+                pbar.update(1)
+                time.sleep(0.5)  # API 속도 제한
+
+        # 요약 결과 통계
+        print("\n" + "-" * 60)
+        print("📊 요약 결과 통계")
+        print("-" * 60)
+        print(f"   ✅ 요약 성공: {success_count}개")
+        if fail_count > 0:
+            print(f"   ⚠️ 요약 실패: {fail_count}개 (초록으로 대체)")
+        print("-" * 60)
 
         # 요약 결과 출력
-        print("\n" + "=" * 60)
+        print("\n" + "=" * 70)
         print("📋 논문 요약 결과")
-        print("=" * 60)
+        print("=" * 70)
 
         for i, paper in enumerate(summarized_papers):
-            print(f"\n[{i+1}] {paper['title'][:60]}...")
-            print("-" * 40)
-            print(paper.get('summary', 'No summary available'))
-            print("-" * 40)
+            print(f"\n{'─' * 70}")
+            print(f"📄 [{i+1}/{len(summarized_papers)}] {paper['title']}")
+            print(f"{'─' * 70}")
+            print(f"👤 저자: {', '.join(paper['authors'][:3])}" + (" 외" if len(paper['authors']) > 3 else ""))
+            print(f"📅 발행: {paper['published'][:10] if paper.get('published') else 'N/A'}")
+            print(f"📖 출처: {paper['source']}")
+            print(f"{'─' * 70}")
+            print("📝 요약:")
+            print()
+            # 요약 내용 전체 출력 (줄바꿈 유지)
+            summary = paper.get('summary', 'No summary available')
+            for line in summary.split('\n'):
+                print(f"   {line}")
+            print()
 
+        print("=" * 70)
         input("\n⏎ Enter를 눌러 다음 단계로 진행...")
 
         return summarized_papers
@@ -1542,16 +1575,29 @@ class HuggingFaceEmbeddings(Embeddings):
         # 배치 처리
         batch_size = 8
         all_embeddings = []
-
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i+batch_size]
-            embeddings = self._encode(batch)
-            all_embeddings.extend(embeddings)
-            if len(texts) > batch_size:
-                print(f"   진행: {min(i+batch_size, len(texts))}/{len(texts)}", end='\r')
+        total_batches = (len(texts) + batch_size - 1) // batch_size
 
         if len(texts) > batch_size:
-            print()
+            # tqdm 진행 바 사용
+            with tqdm(
+                total=len(texts),
+                desc="   🧠 임베딩 생성",
+                bar_format='{desc}: {percentage:3.0f}%|{bar:25}| {n}/{total} [{elapsed}<{remaining}, {rate_fmt}]',
+                unit="문서",
+                colour='cyan'
+            ) as pbar:
+                for i in range(0, len(texts), batch_size):
+                    batch = texts[i:i+batch_size]
+                    embeddings = self._encode(batch)
+                    all_embeddings.extend(embeddings)
+                    pbar.update(len(batch))
+        else:
+            # 적은 수의 문서는 진행 바 없이 처리
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i+batch_size]
+                embeddings = self._encode(batch)
+                all_embeddings.extend(embeddings)
+
         return all_embeddings
 
     def embed_query(self, text: str) -> List[float]:
@@ -1573,19 +1619,35 @@ class OpenAIEmbeddings(Embeddings):
         all_embeddings = []
         batch_size = 100  # OpenAI 배치 제한
 
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i+batch_size]
-            response = self.client.embeddings.create(
-                model=self.model,
-                input=batch
-            )
-            batch_embeddings = [item.embedding for item in response.data]
-            all_embeddings.extend(batch_embeddings)
-            if len(texts) > batch_size:
-                print(f"   진행: {min(i+batch_size, len(texts))}/{len(texts)}", end='\r')
-
         if len(texts) > batch_size:
-            print()
+            # tqdm 진행 바 사용
+            with tqdm(
+                total=len(texts),
+                desc="   🧠 OpenAI 임베딩",
+                bar_format='{desc}: {percentage:3.0f}%|{bar:25}| {n}/{total} [{elapsed}<{remaining}, {rate_fmt}]',
+                unit="문서",
+                colour='green'
+            ) as pbar:
+                for i in range(0, len(texts), batch_size):
+                    batch = texts[i:i+batch_size]
+                    response = self.client.embeddings.create(
+                        model=self.model,
+                        input=batch
+                    )
+                    batch_embeddings = [item.embedding for item in response.data]
+                    all_embeddings.extend(batch_embeddings)
+                    pbar.update(len(batch))
+        else:
+            # 적은 수의 문서는 진행 바 없이 처리
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i+batch_size]
+                response = self.client.embeddings.create(
+                    model=self.model,
+                    input=batch
+                )
+                batch_embeddings = [item.embedding for item in response.data]
+                all_embeddings.extend(batch_embeddings)
+
         return all_embeddings
 
     def embed_query(self, text: str) -> List[float]:
@@ -1722,27 +1784,39 @@ class RAGSystem:
         )
 
     def build_vectorstore(self, documents: List[Dict]) -> FAISS:
-        print("\n✂️ 텍스트 청킹 중...")
+        print("\n" + "=" * 60)
+        print("🔧 벡터 DB 생성")
+        print("=" * 60)
 
+        # Step 1: 텍스트 청킹
+        print("\n✂️ Step 1: 텍스트 청킹")
         all_chunks = []
         all_metadata = []
 
-        for doc in documents:
-            chunks = self.text_splitter.split_text(doc['text'])
-            for i, chunk in enumerate(chunks):
-                all_chunks.append(chunk)
-                all_metadata.append({
-                    'source': doc['source'],
-                    'chunk_id': i
-                })
-            print(f"   📄 {doc['source'][:40]}...: {len(chunks)} 청크")
+        with tqdm(
+            total=len(documents),
+            desc="   📄 문서 처리",
+            bar_format='{desc}: {percentage:3.0f}%|{bar:25}| {n}/{total} [{elapsed}<{remaining}]',
+            colour='yellow'
+        ) as pbar:
+            for doc in documents:
+                chunks = self.text_splitter.split_text(doc['text'])
+                for i, chunk in enumerate(chunks):
+                    all_chunks.append(chunk)
+                    all_metadata.append({
+                        'source': doc['source'],
+                        'chunk_id': i
+                    })
+                pbar.set_postfix_str(f"{len(chunks)} 청크")
+                pbar.update(1)
 
-        print(f"\n📊 총 청크 수: {len(all_chunks)}개")
+        print(f"   📊 총 청크 수: {len(all_chunks)}개")
 
         if not all_chunks:
             raise ValueError("청킹된 텍스트가 없습니다!")
 
-        print("\n💾 벡터 DB 생성 중...")
+        # Step 2: 임베딩 생성 및 벡터 DB 생성
+        print("\n🧠 Step 2: 임베딩 생성 및 벡터 DB 구축")
 
         self.vectorstore = FAISS.from_texts(
             texts=all_chunks,
@@ -1750,7 +1824,8 @@ class RAGSystem:
             metadatas=all_metadata
         )
 
-        print("✅ 벡터 DB 생성 완료!")
+        print("\n✅ 벡터 DB 생성 완료!")
+        print("-" * 60)
         return self.vectorstore
 
     def save_vectorstore(self, path: str = VECTORSTORE_DIR):
@@ -1989,84 +2064,115 @@ class QdrantHybridSearch:
         from qdrant_client.models import PointStruct, SparseVector
         import uuid
 
-        print("\n📄 문서 처리 중...")
+        print("\n" + "=" * 60)
+        print("🔧 Qdrant 벡터 DB 구축")
+        print("=" * 60)
 
+        # Step 1: 청킹
+        print("\n✂️ Step 1: 텍스트 청킹")
         all_chunks = []
         all_metadata = []
 
-        # 청킹
-        for doc in documents:
-            chunks = text_splitter.split_text(doc['text'])
-            for i, chunk in enumerate(chunks):
-                all_chunks.append(chunk)
-                # 풍부한 메타데이터
-                all_metadata.append({
-                    'source': doc['source'],
-                    'filepath': doc.get('filepath', ''),
-                    'chunk_id': i,
-                    'chunk_total': len(chunks),
-                    'text_length': len(chunk)
-                })
-            print(f"   📄 {doc['source'][:40]}...: {len(chunks)} 청크")
+        with tqdm(
+            total=len(documents),
+            desc="   📄 문서 처리",
+            bar_format='{desc}: {percentage:3.0f}%|{bar:25}| {n}/{total} [{elapsed}<{remaining}]',
+            colour='yellow'
+        ) as pbar:
+            for doc in documents:
+                chunks = text_splitter.split_text(doc['text'])
+                for i, chunk in enumerate(chunks):
+                    all_chunks.append(chunk)
+                    all_metadata.append({
+                        'source': doc['source'],
+                        'filepath': doc.get('filepath', ''),
+                        'chunk_id': i,
+                        'chunk_total': len(chunks),
+                        'text_length': len(chunk)
+                    })
+                pbar.set_postfix_str(f"{len(chunks)} 청크")
+                pbar.update(1)
 
-        print(f"\n📊 총 청크 수: {len(all_chunks)}개")
+        print(f"   📊 총 청크 수: {len(all_chunks)}개")
 
         if not all_chunks:
             raise ValueError("청킹된 텍스트가 없습니다!")
 
         self.chunks = [{'content': c, **m} for c, m in zip(all_chunks, all_metadata)]
 
-        # Dense 임베딩 생성
-        print("\n🧠 Dense 임베딩 생성 중...")
+        # Step 2: Dense 임베딩 생성
+        print("\n🧠 Step 2: Dense 임베딩 생성")
         dense_vectors = self.embeddings.embed_documents(all_chunks)
 
-        # Sparse 벡터 생성
+        # Step 3: Sparse 벡터 생성
         sparse_method_name = self.sparse_method.upper()
-        print(f"🔤 Sparse 벡터 생성 중... ({sparse_method_name})")
+        print(f"\n🔤 Step 3: Sparse 벡터 생성 ({sparse_method_name})")
         sparse_vectors = []
-        for chunk in all_chunks:
-            sv = self._text_to_sparse_vector(chunk)
-            sparse_vectors.append(sv)
 
-        # Qdrant에 저장
-        print("\n💾 Qdrant에 저장 중...")
+        with tqdm(
+            total=len(all_chunks),
+            desc=f"   📊 {sparse_method_name}",
+            bar_format='{desc}: {percentage:3.0f}%|{bar:25}| {n}/{total} [{elapsed}<{remaining}]',
+            colour='magenta'
+        ) as pbar:
+            for chunk in all_chunks:
+                sv = self._text_to_sparse_vector(chunk)
+                sparse_vectors.append(sv)
+                pbar.update(1)
+
+        # Step 4: Qdrant에 저장
+        print("\n💾 Step 4: Qdrant 저장")
         points = []
-        for i, (chunk, dense_vec, sparse_vec, metadata) in enumerate(
-            zip(all_chunks, dense_vectors, sparse_vectors, all_metadata)
-        ):
-            # Sparse 벡터를 Qdrant 형식으로 변환
-            sparse_indices = list(sparse_vec.keys())
-            sparse_values = list(sparse_vec.values())
 
-            point = PointStruct(
-                id=str(uuid.uuid4()),
-                vector={
-                    "dense": dense_vec,
-                    "sparse": SparseVector(
-                        indices=sparse_indices,
-                        values=sparse_values
-                    )
-                },
-                payload={
-                    "text": chunk,
-                    **metadata
-                }
-            )
-            points.append(point)
+        with tqdm(
+            total=len(all_chunks),
+            desc="   🔧 포인트 생성",
+            bar_format='{desc}: {percentage:3.0f}%|{bar:25}| {n}/{total} [{elapsed}<{remaining}]',
+            colour='blue'
+        ) as pbar:
+            for i, (chunk, dense_vec, sparse_vec, metadata) in enumerate(
+                zip(all_chunks, dense_vectors, sparse_vectors, all_metadata)
+            ):
+                sparse_indices = list(sparse_vec.keys())
+                sparse_values = list(sparse_vec.values())
 
-            if (i + 1) % 50 == 0:
-                print(f"   진행: {i + 1}/{len(all_chunks)}", end='\r')
+                point = PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector={
+                        "dense": dense_vec,
+                        "sparse": SparseVector(
+                            indices=sparse_indices,
+                            values=sparse_values
+                        )
+                    },
+                    payload={
+                        "text": chunk,
+                        **metadata
+                    }
+                )
+                points.append(point)
+                pbar.update(1)
 
         # 배치 업로드
         batch_size = 100
-        for i in range(0, len(points), batch_size):
-            batch = points[i:i + batch_size]
-            self.client.upsert(
-                collection_name=self.collection_name,
-                points=batch
-            )
+        total_batches = (len(points) + batch_size - 1) // batch_size
+
+        with tqdm(
+            total=total_batches,
+            desc="   📤 Qdrant 업로드",
+            bar_format='{desc}: {percentage:3.0f}%|{bar:25}| {n}/{total} [{elapsed}<{remaining}]',
+            colour='green'
+        ) as pbar:
+            for i in range(0, len(points), batch_size):
+                batch = points[i:i + batch_size]
+                self.client.upsert(
+                    collection_name=self.collection_name,
+                    points=batch
+                )
+                pbar.update(1)
 
         print(f"\n✅ Qdrant 저장 완료! ({len(points)}개 벡터)")
+        print("-" * 60)
 
         # 컬렉션 정보 출력
         info = self.client.get_collection(self.collection_name)
