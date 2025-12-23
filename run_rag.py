@@ -142,6 +142,10 @@ class Config:
         # Reranking 설정
         self.use_reranking = False
         self.reranker_model = 'ms-marco'  # 'ms-marco', 'ms-marco-large', 'bge-reranker', 'bge-reranker-large'
+        # LangSmith 설정
+        self.use_langsmith = False
+        self.langsmith_project = 'medical-paper-rag'
+        self.langchain_api_key = os.getenv('LANGCHAIN_API_KEY') or None
         # .env 파일에서 API 키 로드
         self.pubmed_api_key = os.getenv('PUBMED_API_KEY') or None
         self.pubmed_email = os.getenv('PUBMED_EMAIL') or None
@@ -264,6 +268,23 @@ class Config:
             print("   발급: https://platform.openai.com/api-keys")
             self.openai_api_key = input("   OpenAI API Key: ").strip() or None
 
+        # LangSmith 설정 (웹 모니터링)
+        print("\n📊 LangSmith 설정 (웹 기반 진행상황 모니터링):")
+        print("   LangSmith로 RAG 파이프라인을 실시간 추적할 수 있습니다.")
+        print("   발급: https://smith.langchain.com")
+        if self.langchain_api_key:
+            print(f"   ✅ .env에서 로드됨 (Key: {self.langchain_api_key[:12]}...)")
+            langsmith_choice = input("   LangSmith 활성화? [y/N]: ").strip().lower()
+            self.use_langsmith = langsmith_choice in ['y', 'yes', '예']
+        else:
+            print("   API 키가 없으면 Enter를 누르세요.")
+            self.langchain_api_key = input("   LangChain API Key: ").strip() or None
+            if self.langchain_api_key:
+                self.use_langsmith = True
+                project_name = input(f"   프로젝트 이름 [{self.langsmith_project}]: ").strip()
+                if project_name:
+                    self.langsmith_project = project_name
+
         # 한국어 검색어인 경우 영어로 번역
         if self.language == 'ko':
             print("\n🔄 한국어 검색어를 영어로 번역 중...")
@@ -292,9 +313,305 @@ class Config:
             print(f"   🔑 PubMed API: 설정됨")
         if self.openai_api_key:
             print(f"   🤖 OpenAI API: 설정됨 (요약/번역 활성화)")
+        if self.use_langsmith:
+            print(f"   📊 LangSmith: 활성화 ({self.langsmith_project})")
         print("-" * 60)
 
         return self
+
+
+# ==================== LangSmith 설정 ====================
+_LANGSMITH_ENABLED = False
+
+def setup_langsmith(config: Config) -> bool:
+    """LangSmith 환경 설정 및 초기화"""
+    global _LANGSMITH_ENABLED
+
+    if not config.use_langsmith:
+        return False
+
+    if not config.langchain_api_key:
+        print("\n⚠️ LangSmith API 키가 설정되지 않았습니다.")
+        print("   .env 파일에 LANGCHAIN_API_KEY를 추가하거나")
+        print("   https://smith.langchain.com 에서 발급받으세요.")
+        config.use_langsmith = False
+        return False
+
+    try:
+        # LangSmith 환경 변수 설정
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        os.environ["LANGCHAIN_PROJECT"] = config.langsmith_project
+        os.environ["LANGCHAIN_API_KEY"] = config.langchain_api_key
+        os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
+
+        _LANGSMITH_ENABLED = True
+
+        print(f"\n✅ LangSmith 활성화됨")
+        print(f"   📊 프로젝트: {config.langsmith_project}")
+        print(f"   🌐 대시보드: https://smith.langchain.com/o/default/projects")
+
+        return True
+    except Exception as e:
+        print(f"\n⚠️ LangSmith 설정 실패: {str(e)[:50]}")
+        config.use_langsmith = False
+        return False
+
+
+def get_langsmith_callback():
+    """LangSmith 콜백 핸들러 반환"""
+    try:
+        from langchain_core.tracers import LangChainTracer
+        return LangChainTracer()
+    except ImportError:
+        return None
+
+
+def traceable_wrapper(run_type: str = "chain", name: str = None):
+    """LangSmith traceable 데코레이터 래퍼 - 설치되지 않은 경우 무시"""
+    def decorator(func):
+        # LangSmith가 활성화되지 않은 경우 원본 함수 반환
+        if not os.environ.get("LANGCHAIN_TRACING_V2") == "true":
+            return func
+
+        try:
+            from langsmith import traceable
+            trace_name = name or func.__name__
+            return traceable(run_type=run_type, name=trace_name)(func)
+        except ImportError:
+            return func
+    return decorator
+
+
+def get_traceable():
+    """langsmith traceable 데코레이터 반환 (없으면 더미 반환)"""
+    if os.environ.get("LANGCHAIN_TRACING_V2") == "true":
+        try:
+            from langsmith import traceable
+            return traceable
+        except ImportError:
+            pass
+
+    # 더미 데코레이터
+    def dummy_traceable(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    return dummy_traceable
+
+
+# 전역 traceable 데코레이터 (import 시점에 설정)
+try:
+    if os.environ.get("LANGCHAIN_TRACING_V2") == "true":
+        from langsmith import traceable as ls_traceable
+    else:
+        def ls_traceable(*args, **kwargs):
+            def decorator(func):
+                return func
+            return decorator
+except ImportError:
+    def ls_traceable(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
+
+class LangSmithTracer:
+    """LangSmith 추적을 위한 컨텍스트 매니저 (langsmith 0.5+ 호환)"""
+
+    def __init__(self, name: str, run_type: str = "chain", metadata: dict = None):
+        self.name = name
+        self.run_type = run_type
+        self.metadata = metadata or {}
+        self.run_id = None
+        self.client = None
+        self.inputs = {}
+        self.outputs = {}
+        self.start_time = None
+
+    def __enter__(self):
+        if not os.environ.get("LANGCHAIN_TRACING_V2") == "true":
+            return self
+
+        try:
+            from langsmith import Client
+            import uuid
+            from datetime import datetime
+
+            self.client = Client()
+            self.run_id = str(uuid.uuid4())
+            self.start_time = datetime.utcnow()
+
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.client and self.run_id:
+            try:
+                from datetime import datetime
+
+                self.client.create_run(
+                    name=self.name,
+                    run_type=self.run_type,
+                    id=self.run_id,
+                    inputs=self.inputs,
+                    outputs=self.outputs,
+                    start_time=self.start_time,
+                    end_time=datetime.utcnow(),
+                    extra={"metadata": self.metadata},
+                    error=str(exc_val) if exc_val else None
+                )
+            except Exception:
+                pass
+        return False
+
+    def log_input(self, inputs: dict):
+        """입력 로깅"""
+        self.inputs.update(inputs)
+
+    def log_output(self, outputs: dict):
+        """출력 로깅"""
+        self.outputs.update(outputs)
+
+
+# ==================== LangChain Agent ====================
+class RAGAgent:
+    """LangChain Agent를 사용한 RAG 시스템"""
+
+    def __init__(self, openai_api_key: str = None, rag_system=None):
+        self.openai_api_key = openai_api_key
+        self.rag_system = rag_system
+        self.agent = None
+        self.tools = []
+
+    def _create_tools(self):
+        """에이전트 도구 생성"""
+        from langchain.tools import Tool
+
+        tools = []
+
+        # 날씨 도구 (예시)
+        def get_weather(city: str) -> str:
+            """Get weather for a given city."""
+            return f"It's always sunny in {city}!"
+
+        tools.append(Tool(
+            name="get_weather",
+            func=get_weather,
+            description="Get the current weather for a city"
+        ))
+
+        # RAG 검색 도구
+        if self.rag_system:
+            def search_papers(query: str) -> str:
+                """Search medical/scientific papers."""
+                results = self.rag_system.search(query, k=3)
+                if not results:
+                    return "No relevant papers found."
+                response = "Found papers:\n"
+                for i, r in enumerate(results, 1):
+                    response += f"{i}. {r['source'][:50]}...\n   {r['content'][:200]}...\n\n"
+                return response
+
+            tools.append(Tool(
+                name="search_papers",
+                func=search_papers,
+                description="Search medical and scientific papers for information"
+            ))
+
+        self.tools = tools
+        return tools
+
+    def create_agent(self):
+        """LangChain Agent 생성"""
+        if not self.openai_api_key:
+            print("⚠️ OpenAI API 키가 필요합니다.")
+            return None
+
+        try:
+            from langchain_openai import ChatOpenAI
+            from langchain.agents import AgentExecutor, create_react_agent
+            from langchain import hub
+
+            # LLM 설정
+            llm = ChatOpenAI(
+                model="gpt-3.5-turbo",
+                temperature=0,
+                api_key=self.openai_api_key
+            )
+
+            # 도구 생성
+            tools = self._create_tools()
+
+            # ReAct 프롬프트 가져오기
+            prompt = hub.pull("hwchase17/react")
+
+            # Agent 생성
+            agent = create_react_agent(llm, tools, prompt)
+
+            # Agent Executor 생성
+            self.agent = AgentExecutor(
+                agent=agent,
+                tools=tools,
+                verbose=True,
+                handle_parsing_errors=True
+            )
+
+            print("✅ LangChain Agent 생성 완료!")
+            return self.agent
+
+        except ImportError as e:
+            print(f"⚠️ 필요한 패키지 설치: pip install langchain langchain-openai langchainhub")
+            print(f"   오류: {str(e)[:50]}")
+            return None
+        except Exception as e:
+            print(f"⚠️ Agent 생성 실패: {str(e)[:50]}")
+            return None
+
+    def invoke(self, query: str) -> str:
+        """Agent 실행"""
+        if not self.agent:
+            self.create_agent()
+
+        if not self.agent:
+            return "Agent를 생성할 수 없습니다."
+
+        try:
+            # LangSmith 트레이싱
+            with LangSmithTracer("RAG_Agent", run_type="chain",
+                                metadata={"query": query}) as tracer:
+                tracer.log_input({"query": query})
+
+                result = self.agent.invoke({"input": query})
+                output = result.get("output", "No response")
+
+                tracer.log_output({"output": output})
+
+            return output
+        except Exception as e:
+            return f"Agent 실행 오류: {str(e)}"
+
+    def chat(self):
+        """대화형 Agent 세션"""
+        print("\n" + "=" * 60)
+        print("🤖 LangChain Agent 대화 모드")
+        print("=" * 60)
+        print("   'quit' 또는 'exit'로 종료")
+        print("-" * 60)
+
+        while True:
+            query = input("\n🧑 You: ").strip()
+            if query.lower() in ['quit', 'exit', 'q']:
+                print("\n👋 Agent 세션 종료")
+                break
+            if not query:
+                continue
+
+            print("\n🤖 Agent:")
+            response = self.invoke(query)
+            print(response)
 
 
 # ==================== 논문 요약 클래스 ====================
@@ -381,19 +698,26 @@ Content:
 """
 
                 try:
-                    response = client.chat.completions.create(
-                        model="gpt-3.5-turbo",
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": content_to_summarize}
-                        ],
-                        max_tokens=500,
-                        temperature=0.3
-                    )
+                    # LangSmith 트레이싱
+                    with LangSmithTracer("Paper_Summary_LLM", run_type="llm",
+                                        metadata={"paper_title": paper['title'][:50]}) as tracer:
+                        tracer.log_input({"system": system_prompt, "user": content_to_summarize[:500]})
 
-                    summary = response.choices[0].message.content
-                    paper['summary'] = summary
-                    success_count += 1
+                        response = client.chat.completions.create(
+                            model="gpt-3.5-turbo",
+                            messages=[
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": content_to_summarize}
+                            ],
+                            max_tokens=500,
+                            temperature=0.3
+                        )
+
+                        summary = response.choices[0].message.content
+                        paper['summary'] = summary
+                        success_count += 1
+
+                        tracer.log_output({"summary": summary[:200]})
 
                 except Exception as e:
                     # 실패 시 전체 초록 사용
@@ -1885,6 +2209,12 @@ class EmbeddingModelFactory:
             'dimension': 768,
             'type': 'huggingface'
         },
+        'minilm': {
+            'name': 'sentence-transformers/all-MiniLM-L6-v2',
+            'description': '일반 목적 (가볍고 빠름)',
+            'dimension': 384,
+            'type': 'huggingface'
+        },
         # OpenAI API 모델
         'openai-small': {
             'name': 'text-embedding-3-small',
@@ -2021,30 +2351,44 @@ class RAGSystem:
             print("❌ 벡터 스토어가 없습니다.")
             return []
 
-        docs_with_scores = self.vectorstore.similarity_search_with_score(query, k=k)
+        # LangSmith 트레이싱
+        with LangSmithTracer("RAG_Search", run_type="retriever", metadata={"query": query, "k": k}) as tracer:
+            tracer.log_input({"query": query, "k": k})
 
-        results = []
-        for doc, score in docs_with_scores:
-            results.append({
-                'content': doc.page_content,
-                'source': doc.metadata.get('source', 'Unknown'),
-                'score': float(score)
-            })
+            docs_with_scores = self.vectorstore.similarity_search_with_score(query, k=k)
+
+            results = []
+            for doc, score in docs_with_scores:
+                results.append({
+                    'content': doc.page_content,
+                    'source': doc.metadata.get('source', 'Unknown'),
+                    'score': float(score)
+                })
+
+            tracer.log_output({"results_count": len(results), "results": results})
 
         return results
 
     def answer(self, question: str, k: int = 3) -> Dict:
-        # 질문 언어 감지
-        q_language = detect_language(question)
+        # LangSmith 트레이싱
+        with LangSmithTracer("RAG_Answer", run_type="chain", metadata={"question": question}) as tracer:
+            tracer.log_input({"question": question, "k": k})
 
-        results = self.search(question, k=k)
+            # 질문 언어 감지
+            q_language = detect_language(question)
 
-        return {
-            'question': question,
-            'contexts': results,
-            'sources': list(set([r['source'] for r in results])),
-            'language': q_language
-        }
+            results = self.search(question, k=k)
+
+            response = {
+                'question': question,
+                'contexts': results,
+                'sources': list(set([r['source'] for r in results])),
+                'language': q_language
+            }
+
+            tracer.log_output(response)
+
+        return response
 
     def get_all_chunks(self) -> List[Dict]:
         """저장된 모든 청크와 메타데이터 반환"""
@@ -2474,6 +2818,12 @@ class QdrantHybridSearch:
         """
         import numpy as np
 
+        # LangSmith 트레이싱 시작
+        _tracer = LangSmithTracer("Qdrant_Hybrid_Search", run_type="retriever",
+                                 metadata={"query": query, "k": k, "alpha": alpha})
+        _tracer.__enter__()
+        _tracer.log_input({"query": query, "k": k, "alpha": alpha, "use_reranking": use_reranking})
+
         # Reranking 설정
         apply_reranking = use_reranking if use_reranking is not None else self.use_reranking
         rerank_candidates = rerank_top_k if rerank_top_k else max(k * 3, 20)
@@ -2561,8 +2911,14 @@ class QdrantHybridSearch:
             # reranked 결과에 method 업데이트
             for r in reranked:
                 r['method'] = 'hybrid+rerank'
+            # LangSmith 트레이싱 종료
+            _tracer.log_output({"results_count": len(reranked), "method": "hybrid+rerank"})
+            _tracer.__exit__(None, None, None)
             return reranked
 
+        # LangSmith 트레이싱 종료
+        _tracer.log_output({"results_count": len(results[:k]), "method": "hybrid"})
+        _tracer.__exit__(None, None, None)
         return results[:k]
 
     def search_with_filter(
@@ -3390,6 +3746,80 @@ def interactive_qa(rag: RAGSystem, openai_api_key: str = None):
             print(f"❌ Error: {str(e)}")
 
 
+# ==================== Agent 모드 실행 ====================
+def run_agent_mode():
+    """LangChain Agent 모드 실행"""
+    print("\n" + "=" * 60)
+    print("🤖 LangChain Agent 모드")
+    print("=" * 60)
+
+    # .env에서 API 키 로드
+    openai_api_key = os.getenv('OPENAI_API_KEY')
+    langchain_api_key = os.getenv('LANGCHAIN_API_KEY')
+
+    if not openai_api_key:
+        print("\n❌ OpenAI API 키가 필요합니다.")
+        print("   .env 파일에 OPENAI_API_KEY를 설정해주세요.")
+        return
+
+    print("   ✅ OpenAI API 연결됨")
+
+    # LangSmith 설정
+    if langchain_api_key:
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        os.environ["LANGCHAIN_PROJECT"] = "medical-paper-rag-agent"
+        os.environ["LANGCHAIN_API_KEY"] = langchain_api_key
+        print("   ✅ LangSmith 추적 활성화")
+        print(f"   📊 대시보드: https://smith.langchain.com")
+
+    # RAG 시스템 사용 여부 확인
+    use_rag = input("\n📚 RAG 시스템 연동 (논문 검색 기능)? [y/N]: ").strip().lower()
+
+    rag_system = None
+    if use_rag in ['y', 'yes']:
+        print("\n⚙️ RAG 시스템 설정 중...")
+        config = Config()
+        config.openai_api_key = openai_api_key
+
+        # 간단한 설정
+        config.search_query = input("🔍 검색할 논문 키워드: ").strip() or "medical research"
+        config.max_results = 3
+        config.embedding_model = 'minilm'  # 빠른 모델 사용
+
+        # 논문 검색 및 RAG 구축
+        searcher = PaperSearcher(
+            api_key=os.getenv('PUBMED_API_KEY'),
+            email=os.getenv('PUBMED_EMAIL')
+        )
+        papers = searcher.search(config.search_query, 'pubmed', config.max_results)
+
+        if papers:
+            print(f"   📄 {len(papers)}개 논문 발견")
+
+            # 다운로드 및 텍스트 추출
+            downloader = PDFDownloader(PAPERS_DIR)
+            downloaded = downloader.download_all(papers)
+
+            if downloaded:
+                documents = TextExtractor.extract_all(downloaded)
+
+                if documents:
+                    embeddings = EmbeddingModelFactory.create('minilm')
+                    rag_system = RAGSystem(embeddings)
+                    rag_system.build_vectorstore(documents)
+                    print("   ✅ RAG 시스템 준비 완료")
+
+    # Agent 생성 및 실행
+    print("\n🚀 Agent 초기화 중...")
+    agent = RAGAgent(openai_api_key=openai_api_key, rag_system=rag_system)
+
+    if agent.create_agent():
+        agent.chat()
+    else:
+        print("\n❌ Agent 생성에 실패했습니다.")
+        print("   필요 패키지: pip install langchain langchain-openai langchainhub")
+
+
 # ==================== 트렌드 분석 실행 ====================
 def run_trend_analysis():
     """트렌드 분석 모드 실행"""
@@ -3474,6 +3904,7 @@ def main():
     print("\n📋 기능 선택:")
     print("   1. RAG 시스템 (논문 검색 + 질의응답)")
     print("   2. 트렌드 분석 (키워드 기반 연구 동향)")
+    print("   3. Agent 모드 (LangChain Agent 대화)")
     mode = input("선택 [1]: ").strip() or "1"
 
     if mode == "2":
@@ -3481,8 +3912,17 @@ def main():
         run_trend_analysis()
         return
 
+    if mode == "3":
+        # Agent 모드
+        run_agent_mode()
+        return
+
     # 1. 대화형 설정
     config = Config().interactive_setup()
+
+    # LangSmith 설정 (활성화된 경우)
+    if config.use_langsmith:
+        setup_langsmith(config)
 
     # 2. 논문 검색 (영어로 검색)
     print("\n" + "=" * 60)
