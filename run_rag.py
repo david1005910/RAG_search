@@ -131,6 +131,7 @@ class Config:
     """RAG 시스템 설정"""
     def __init__(self):
         self.search_source = 'pubmed'
+        self.search_mode = 3  # 1: 검색분야만, 2: 검색내용만(vectorDB), 3: 검색분야+검색내용
         self.search_field = ''  # 검색분야 (예: cardiology, oncology)
         self.search_content = ''  # 검색내용 (구체적인 검색어)
         self.search_query = ''  # 원본 검색어 (검색분야 + 검색내용)
@@ -183,20 +184,50 @@ class Config:
         else:
             self.search_source = source_map.get(choice, 'pubmed')
 
-        # 검색분야 입력
-        self.search_field = input("\n📂 검색분야 입력 (예: cardiology, oncology, 심장학): ").strip()
-        if not self.search_field:
-            self.search_field = "COVID-19"
-            print(f"   기본값 사용: {self.search_field}")
+        # 검색 방식 선택
+        print("\n🔎 검색 방식 선택:")
+        print("   1. 검색분야만 (새 논문 검색)")
+        print("   2. 검색내용만 (기존 VectorDB에서 검색)")
+        print("   3. 검색분야 + 검색내용 (새 논문 검색) [기본값]")
+        mode_choice = input("선택 [3]: ").strip() or "3"
+        self.search_mode = int(mode_choice) if mode_choice in ['1', '2', '3'] else 3
 
-        # 검색내용 입력
-        self.search_content = input("🔍 검색내용 입력 (예: treatment, diagnosis, 치료): ").strip()
-        if not self.search_content:
-            self.search_content = "vaccine efficacy"
-            print(f"   기본값 사용: {self.search_content}")
+        mode_names = {1: "검색분야만", 2: "검색내용만 (VectorDB)", 3: "검색분야 + 검색내용"}
+        print(f"   ✓ 선택된 방식: {mode_names[self.search_mode]}")
 
-        # 검색분야 + 검색내용 결합
-        self.search_query = f"{self.search_field} {self.search_content}"
+        # 검색 방식에 따른 입력 처리
+        if self.search_mode == 1:
+            # 검색분야만 입력
+            self.search_field = input("\n📂 검색분야 입력 (예: cardiology, oncology, 심장학): ").strip()
+            if not self.search_field:
+                self.search_field = "COVID-19"
+                print(f"   기본값 사용: {self.search_field}")
+            self.search_content = ''
+            self.search_query = self.search_field
+
+        elif self.search_mode == 2:
+            # 검색내용만 입력 (VectorDB 검색용)
+            self.search_content = input("\n🔍 검색내용 입력 (VectorDB에서 검색할 내용): ").strip()
+            if not self.search_content:
+                self.search_content = "treatment efficacy"
+                print(f"   기본값 사용: {self.search_content}")
+            self.search_field = ''
+            self.search_query = self.search_content
+
+        else:  # self.search_mode == 3
+            # 검색분야 + 검색내용 모두 입력
+            self.search_field = input("\n📂 검색분야 입력 (예: cardiology, oncology, 심장학): ").strip()
+            if not self.search_field:
+                self.search_field = "COVID-19"
+                print(f"   기본값 사용: {self.search_field}")
+
+            self.search_content = input("🔍 검색내용 입력 (예: treatment, diagnosis, 치료): ").strip()
+            if not self.search_content:
+                self.search_content = "vaccine efficacy"
+                print(f"   기본값 사용: {self.search_content}")
+
+            self.search_query = f"{self.search_field} {self.search_content}"
+
         print(f"   📋 검색어: {self.search_query}")
 
         # 언어 감지
@@ -320,8 +351,8 @@ class Config:
                 if project_name:
                     self.langsmith_project = project_name
 
-        # 한국어인 경우 영어로 번역
-        if self.language == 'ko':
+        # 한국어인 경우 영어로 번역 (모드 2는 번역 불필요)
+        if self.language == 'ko' and self.search_mode != 2:
             print("\n🔄 한국어 검색어를 영어로 번역 중...")
             self.search_query_en = translate_to_english(self.search_query, self.openai_api_key)
             print(f"   🇰🇷 원본: {self.search_query}")
@@ -329,12 +360,17 @@ class Config:
         else:
             self.search_query_en = self.search_query
 
+        mode_names = {1: "검색분야만 (새 논문 검색)", 2: "검색내용만 (VectorDB 검색)", 3: "검색분야 + 검색내용 (새 논문 검색)"}
         print("\n" + "-" * 60)
         print("✅ 설정 완료!")
-        print(f"   📖 소스: {self.search_source}")
-        print(f"   📂 검색분야: {self.search_field}")
-        print(f"   🔍 검색내용: {self.search_content}")
-        if self.language == 'ko':
+        print(f"   🔎 검색방식: {mode_names[self.search_mode]}")
+        if self.search_mode != 2:
+            print(f"   📖 소스: {self.search_source}")
+        if self.search_field:
+            print(f"   📂 검색분야: {self.search_field}")
+        if self.search_content:
+            print(f"   🔍 검색내용: {self.search_content}")
+        if self.language == 'ko' and self.search_mode != 2:
             print(f"   📋 검색어(영문): {self.search_query_en}")
         print(f"   🌐 언어: {lang_name} (응답도 {lang_name}로)")
         print(f"   📄 최대 논문: {self.max_results}")
@@ -3330,6 +3366,25 @@ class RAGSystem:
             self.vectorstore.save_local(path)
             print(f"💾 벡터 DB 저장 완료: {path}")
 
+    def load_vectorstore(self, path: str = VECTORSTORE_DIR) -> bool:
+        """저장된 VectorDB 로드"""
+        import os
+        if os.path.exists(path):
+            try:
+                self.vectorstore = FAISS.load_local(
+                    path,
+                    self.embeddings,
+                    allow_dangerous_deserialization=True
+                )
+                print(f"📂 벡터 DB 로드 완료: {path}")
+                return True
+            except Exception as e:
+                print(f"❌ 벡터 DB 로드 실패: {e}")
+                return False
+        else:
+            print(f"❌ 벡터 DB가 존재하지 않습니다: {path}")
+            return False
+
     def search(self, query: str, k: int = 3) -> List[Dict]:
         if not self.vectorstore:
             print("❌ 벡터 스토어가 없습니다.")
@@ -5117,6 +5172,38 @@ def main():
     if config.use_langsmith:
         setup_langsmith(config)
 
+    # 검색 모드 2: VectorDB에서만 검색 (논문 검색 생략)
+    if config.search_mode == 2:
+        print("\n" + "=" * 60)
+        print("🔍 VectorDB 검색 모드 - 기존 데이터에서 검색")
+        print("=" * 60)
+
+        # 임베딩 모델 로드
+        print("\n🧠 임베딩 모델 로드 중...")
+        embeddings = EmbeddingModelFactory.create(
+            model_type=config.embedding_model,
+            device='cpu',
+            openai_api_key=config.openai_api_key
+        )
+
+        # RAG 시스템 생성 및 VectorDB 로드
+        rag = RAGSystem(
+            embeddings=embeddings,
+            chunk_size=config.chunk_size,
+            chunk_overlap=config.chunk_overlap,
+            language=config.language
+        )
+
+        if not rag.load_vectorstore():
+            print("\n❌ 저장된 VectorDB가 없습니다. 먼저 논문을 검색하여 VectorDB를 생성하세요.")
+            print("   (검색 방식 1 또는 3을 사용하세요)")
+            return
+
+        # 바로 대화형 질의응답으로 이동
+        interactive_qa(rag, config.openai_api_key)
+        return
+
+    # 검색 모드 1, 3: 논문 검색 진행
     # 2. 논문 검색 (영어로 검색)
     print("\n" + "=" * 60)
     print("📚 Step 1: 논문 검색")
