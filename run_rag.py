@@ -131,8 +131,8 @@ class Config:
     """RAG 시스템 설정"""
     def __init__(self):
         self.search_source = 'pubmed'
-        self.search_query = ''  # 원본 검색어 (한국어 가능)
-        self.search_query_en = ''  # 영어로 번역된 검색어 (실제 검색용)
+        self.search_query = ''  # 원본 검색분야 (한국어 가능)
+        self.search_query_en = ''  # 영어로 번역된 검색분야 (실제 검색용)
         self.max_results = 5
         self.embedding_model = 'pubmedbert'  # 기본값을 PubMedBERT로 변경
         self.sparse_method = 'bm25'  # 'bm25' 또는 'splade'
@@ -181,8 +181,8 @@ class Config:
         else:
             self.search_source = source_map.get(choice, 'pubmed')
 
-        # 검색어 입력
-        self.search_query = input("\n🔍 검색어 입력: ").strip()
+        # 검색분야 입력
+        self.search_query = input("\n🔍 검색분야 입력: ").strip()
         if not self.search_query:
             self.search_query = "COVID-19 vaccine efficacy"
             print(f"   기본값 사용: {self.search_query}")
@@ -308,9 +308,9 @@ class Config:
                 if project_name:
                     self.langsmith_project = project_name
 
-        # 한국어 검색어인 경우 영어로 번역
+        # 한국어 검색분야인 경우 영어로 번역
         if self.language == 'ko':
-            print("\n🔄 한국어 검색어를 영어로 번역 중...")
+            print("\n🔄 한국어 검색분야를 영어로 번역 중...")
             self.search_query_en = translate_to_english(self.search_query, self.openai_api_key)
             print(f"   🇰🇷 원본: {self.search_query}")
             print(f"   🇺🇸 번역: {self.search_query_en}")
@@ -320,9 +320,9 @@ class Config:
         print("\n" + "-" * 60)
         print("✅ 설정 완료!")
         print(f"   📖 소스: {self.search_source}")
-        print(f"   🔍 검색어: {self.search_query}")
+        print(f"   🔍 검색분야: {self.search_query}")
         if self.language == 'ko':
-            print(f"   🔍 검색어(영문): {self.search_query_en}")
+            print(f"   🔍 검색분야(영문): {self.search_query_en}")
         print(f"   🌐 언어: {lang_name} (응답도 {lang_name}로)")
         print(f"   📄 최대 논문: {self.max_results}")
         print(f"   🧠 Dense 모델: {self.embedding_model}")
