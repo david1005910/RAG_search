@@ -1,0 +1,20 @@
+---
+config:
+  flowchart:
+    curve: linear
+---
+graph TD;
+	__start__([<p>__start__</p>]):::first
+	process_query(process_query)
+	retrieve_documents(retrieve_documents)
+	create_context(create_context)
+	generate_answer(generate_answer)
+	__end__([<p>__end__</p>]):::last
+	__start__ --> process_query;
+	create_context --> generate_answer;
+	process_query --> retrieve_documents;
+	retrieve_documents --> create_context;
+	generate_answer --> __end__;
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc

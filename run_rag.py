@@ -924,6 +924,130 @@ class LangGraphRAG:
         └─────────────────┘
         """)
 
+    def save_graph(self, filename: str = "langgraph_workflow"):
+        """그래프를 파일로 저장 (Mermaid, PNG, HTML)"""
+        if not self.graph:
+            print("⚠️ 그래프가 생성되지 않았습니다.")
+            return
+
+        print("\n📊 그래프 파일 생성 중...")
+
+        try:
+            graph = self.graph.get_graph()
+
+            # 1. Mermaid 파일 저장
+            mermaid = graph.draw_mermaid()
+            with open(f"{filename}.mmd", 'w') as f:
+                f.write(mermaid)
+            print(f"   ✅ {filename}.mmd 저장 완료")
+
+            # 2. PNG 이미지 저장 시도
+            try:
+                png_data = graph.draw_mermaid_png()
+                with open(f"{filename}.png", 'wb') as f:
+                    f.write(png_data)
+                print(f"   ✅ {filename}.png 저장 완료")
+            except Exception as e:
+                print(f"   ⚠️ PNG 저장 실패: {str(e)[:30]}")
+
+            # 3. HTML 파일 저장
+            html_content = f'''<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LangGraph RAG Workflow</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <style>
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            margin: 0; padding: 20px; min-height: 100vh;
+        }}
+        .container {{
+            max-width: 900px; margin: 0 auto; background: white;
+            border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); padding: 40px;
+        }}
+        h1 {{ text-align: center; color: #1e293b; margin-bottom: 10px; }}
+        .subtitle {{ text-align: center; color: #64748b; margin-bottom: 30px; }}
+        .mermaid {{
+            display: flex; justify-content: center; background: #f8fafc;
+            border-radius: 12px; padding: 30px; margin: 20px 0;
+        }}
+        .steps {{
+            margin-top: 30px; padding: 20px; background: #f1f5f9; border-radius: 12px;
+        }}
+        .step {{
+            display: flex; align-items: center; padding: 12px 0;
+            border-bottom: 1px solid #e2e8f0;
+        }}
+        .step:last-child {{ border-bottom: none; }}
+        .step-num {{
+            width: 30px; height: 30px; background: #0ea5e9; color: white;
+            border-radius: 50%; display: flex; align-items: center;
+            justify-content: center; font-weight: bold; margin-right: 15px;
+        }}
+        .step-content h3 {{ margin: 0; color: #1e293b; }}
+        .step-content p {{ margin: 5px 0 0; color: #64748b; font-size: 14px; }}
+        .footer {{ text-align: center; margin-top: 30px; color: #94a3b8; font-size: 14px; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔄 LangGraph RAG Workflow</h1>
+        <p class="subtitle">Medical/Scientific Paper RAG System</p>
+        <div class="mermaid">
+{mermaid}
+        </div>
+        <div class="steps">
+            <div class="step">
+                <div class="step-num">1</div>
+                <div class="step-content">
+                    <h3>process_query</h3>
+                    <p>사용자 쿼리 처리 및 언어 감지, 필요시 영어로 번역</p>
+                </div>
+            </div>
+            <div class="step">
+                <div class="step-num">2</div>
+                <div class="step-content">
+                    <h3>retrieve_documents</h3>
+                    <p>벡터 DB에서 관련 문서 검색 (FAISS/Qdrant)</p>
+                </div>
+            </div>
+            <div class="step">
+                <div class="step-num">3</div>
+                <div class="step-content">
+                    <h3>create_context</h3>
+                    <p>검색된 문서로부터 컨텍스트 구성</p>
+                </div>
+            </div>
+            <div class="step">
+                <div class="step-num">4</div>
+                <div class="step-content">
+                    <h3>generate_answer</h3>
+                    <p>LLM (GPT-3.5)을 사용하여 최종 답변 생성</p>
+                </div>
+            </div>
+        </div>
+        <div class="footer">
+            <p>📊 LangSmith: <a href="https://smith.langchain.com">smith.langchain.com</a></p>
+        </div>
+    </div>
+    <script>mermaid.initialize({{ startOnLoad: true, theme: 'base' }});</script>
+</body>
+</html>'''
+            with open(f"{filename}.html", 'w', encoding='utf-8') as f:
+                f.write(html_content)
+            print(f"   ✅ {filename}.html 저장 완료")
+
+            print(f"\n📁 저장된 파일:")
+            print(f"   - {filename}.mmd (Mermaid)")
+            print(f"   - {filename}.png (이미지)")
+            print(f"   - {filename}.html (웹 뷰어)")
+
+        except Exception as e:
+            print(f"❌ 그래프 저장 실패: {str(e)}")
+
     def chat(self):
         """대화형 LangGraph RAG 세션"""
         print("\n" + "=" * 60)
@@ -932,6 +1056,7 @@ class LangGraphRAG:
         print("   명령어:")
         print("   - 'status': 워크플로우 상태 보기")
         print("   - 'graph': 그래프 다이어그램 보기")
+        print("   - 'save': 그래프 파일로 저장")
         print("   - 'quit': 종료")
         print("-" * 60)
 
@@ -946,6 +1071,9 @@ class LangGraphRAG:
                 continue
             if query.lower() == 'graph':
                 self.visualize_graph()
+                continue
+            if query.lower() == 'save':
+                self.save_graph()
                 continue
             if not query:
                 continue
@@ -4254,8 +4382,9 @@ def run_langgraph_mode():
     )
 
     if langgraph_rag.build_graph():
-        # 그래프 시각화
+        # 그래프 시각화 및 저장
         langgraph_rag.visualize_graph()
+        langgraph_rag.save_graph()
 
         # 대화 모드
         langgraph_rag.chat()
