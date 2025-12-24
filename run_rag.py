@@ -206,13 +206,11 @@ class Config:
             self.search_query = self.search_field
 
         elif self.search_mode == 2:
-            # 검색내용만 입력 (VectorDB 검색용)
-            self.search_content = input("\n🔍 검색내용 입력 (VectorDB에서 검색할 내용): ").strip()
-            if not self.search_content:
-                self.search_content = "treatment efficacy"
-                print(f"   기본값 사용: {self.search_content}")
+            # VectorDB 검색 모드 - 검색내용은 Q&A 모드에서 입력
             self.search_field = ''
-            self.search_query = self.search_content
+            self.search_content = ''
+            self.search_query = ''
+            print("   ℹ️ VectorDB 모드: Q&A에서 검색내용을 입력하세요")
 
         else:  # self.search_mode == 3
             # 검색분야 + 검색내용 모두 입력
@@ -228,26 +226,32 @@ class Config:
 
             self.search_query = f"{self.search_field} {self.search_content}"
 
-        print(f"   📋 검색어: {self.search_query}")
+        # 모드 2가 아닌 경우에만 검색어 출력 및 언어 감지
+        if self.search_mode != 2:
+            print(f"   📋 검색어: {self.search_query}")
 
-        # 언어 감지
-        self.language = detect_language(self.search_query)
-        lang_name = "한국어" if self.language == 'ko' else "English"
-        print(f"   🌐 감지된 언어: {lang_name}")
+            # 언어 감지
+            self.language = detect_language(self.search_query)
+            lang_name = "한국어" if self.language == 'ko' else "English"
+            print(f"   🌐 감지된 언어: {lang_name}")
 
-        # 요약 출력 언어 선택
-        print("\n🌍 요약 출력 언어 선택:")
-        print("   1. 한국어 (Korean) [기본값]")
-        print("   2. English")
-        summary_lang_choice = input("선택 [1]: ").strip() or "1"
-        self.summary_language = 'en' if summary_lang_choice == '2' else 'ko'
-        summary_lang_name = "한국어" if self.summary_language == 'ko' else "English"
-        print(f"   ✓ 요약 언어: {summary_lang_name}")
+            # 요약 출력 언어 선택
+            print("\n🌍 요약 출력 언어 선택:")
+            print("   1. 한국어 (Korean) [기본값]")
+            print("   2. English")
+            summary_lang_choice = input("선택 [1]: ").strip() or "1"
+            self.summary_language = 'en' if summary_lang_choice == '2' else 'ko'
+            summary_lang_name = "한국어" if self.summary_language == 'ko' else "English"
+            print(f"   ✓ 요약 언어: {summary_lang_name}")
 
-        # 최대 결과 수
-        max_res = input(f"\n📄 최대 논문 수 [{self.max_results}]: ").strip()
-        if max_res.isdigit():
-            self.max_results = int(max_res)
+            # 최대 결과 수
+            max_res = input(f"\n📄 최대 논문 수 [{self.max_results}]: ").strip()
+            if max_res.isdigit():
+                self.max_results = int(max_res)
+        else:
+            # 모드 2: 기본 언어 설정
+            self.language = 'en'
+            lang_name = "English"
 
         # 임베딩 모델 선택
         print("\n🧠 Dense 임베딩 모델 선택:")
@@ -364,16 +368,18 @@ class Config:
         print("\n" + "-" * 60)
         print("✅ 설정 완료!")
         print(f"   🔎 검색방식: {mode_names[self.search_mode]}")
-        if self.search_mode != 2:
+        if self.search_mode == 2:
+            print(f"   💡 Q&A 모드에서 검색내용을 입력하세요")
+        else:
             print(f"   📖 소스: {self.search_source}")
-        if self.search_field:
-            print(f"   📂 검색분야: {self.search_field}")
-        if self.search_content:
-            print(f"   🔍 검색내용: {self.search_content}")
-        if self.language == 'ko' and self.search_mode != 2:
-            print(f"   📋 검색어(영문): {self.search_query_en}")
-        print(f"   🌐 언어: {lang_name} (응답도 {lang_name}로)")
-        print(f"   📄 최대 논문: {self.max_results}")
+            if self.search_field:
+                print(f"   📂 검색분야: {self.search_field}")
+            if self.search_content:
+                print(f"   🔍 검색내용: {self.search_content}")
+            if self.language == 'ko':
+                print(f"   📋 검색어(영문): {self.search_query_en}")
+            print(f"   🌐 언어: {lang_name} (응답도 {lang_name}로)")
+            print(f"   📄 최대 논문: {self.max_results}")
         print(f"   🧠 Dense 모델: {self.embedding_model}")
         print(f"   🔤 Sparse 방식: {self.sparse_method.upper()}")
         print(f"   🗄️ Vector DB: {self.vector_db.upper()}")
