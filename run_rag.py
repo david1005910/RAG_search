@@ -614,6 +614,356 @@ class RAGAgent:
             print(response)
 
 
+# ==================== LangGraph RAG Workflow ====================
+class LangGraphRAG:
+    """LangGraph 기반 RAG 워크플로우 - 진행 상태 추적 가능"""
+
+    def __init__(self, openai_api_key: str = None, rag_system=None, language: str = 'en'):
+        self.openai_api_key = openai_api_key
+        self.rag_system = rag_system
+        self.language = language
+        self.graph = None
+        self.workflow_history = []
+
+    def _create_state_schema(self):
+        """상태 스키마 생성"""
+        from typing import TypedDict, Annotated, Sequence
+        from langchain_core.messages import BaseMessage
+        import operator
+
+        class RAGState(TypedDict):
+            """RAG 워크플로우 상태"""
+            query: str                          # 사용자 질문
+            query_processed: str                # 처리된 질문
+            documents: list                     # 검색된 문서
+            context: str                        # 컨텍스트
+            answer: str                         # 생성된 답변
+            sources: list                       # 참고 문서
+            current_step: str                   # 현재 단계
+            steps_completed: list               # 완료된 단계
+            error: str                          # 에러 메시지
+
+        return RAGState
+
+    def build_graph(self):
+        """LangGraph 워크플로우 그래프 생성"""
+        try:
+            from langgraph.graph import StateGraph, END
+            from langchain_openai import ChatOpenAI
+
+            RAGState = self._create_state_schema()
+
+            # LLM 설정
+            llm = None
+            if self.openai_api_key:
+                llm = ChatOpenAI(
+                    model="gpt-3.5-turbo",
+                    temperature=0.3,
+                    api_key=self.openai_api_key
+                )
+
+            # 노드 함수 정의
+            def process_query(state: RAGState) -> RAGState:
+                """Step 1: 쿼리 처리"""
+                print("   📝 [1/4] 쿼리 처리 중...")
+                query = state["query"]
+
+                # 언어 감지 및 번역
+                lang = detect_language(query)
+                if lang == 'ko' and self.openai_api_key:
+                    query_processed = translate_to_english(query, self.openai_api_key)
+                else:
+                    query_processed = query
+
+                self.workflow_history.append({
+                    "step": "process_query",
+                    "input": query,
+                    "output": query_processed,
+                    "status": "completed"
+                })
+
+                return {
+                    **state,
+                    "query_processed": query_processed,
+                    "current_step": "process_query",
+                    "steps_completed": state.get("steps_completed", []) + ["process_query"]
+                }
+
+            def retrieve_documents(state: RAGState) -> RAGState:
+                """Step 2: 문서 검색"""
+                print("   🔍 [2/4] 문서 검색 중...")
+                query = state["query_processed"]
+                documents = []
+
+                if self.rag_system:
+                    results = self.rag_system.search(query, k=5)
+                    documents = results
+
+                self.workflow_history.append({
+                    "step": "retrieve_documents",
+                    "input": query,
+                    "output": f"{len(documents)} documents found",
+                    "status": "completed"
+                })
+
+                return {
+                    **state,
+                    "documents": documents,
+                    "current_step": "retrieve_documents",
+                    "steps_completed": state.get("steps_completed", []) + ["retrieve_documents"]
+                }
+
+            def create_context(state: RAGState) -> RAGState:
+                """Step 3: 컨텍스트 생성"""
+                print("   📚 [3/4] 컨텍스트 생성 중...")
+                documents = state.get("documents", [])
+
+                context_parts = []
+                sources = []
+                for i, doc in enumerate(documents[:5]):
+                    content = doc.get('content', '')[:500]
+                    source = doc.get('source', f'Document {i+1}')
+                    context_parts.append(f"[{i+1}] {content}")
+                    sources.append(source)
+
+                context = "\n\n".join(context_parts)
+
+                self.workflow_history.append({
+                    "step": "create_context",
+                    "input": f"{len(documents)} documents",
+                    "output": f"Context: {len(context)} chars",
+                    "status": "completed"
+                })
+
+                return {
+                    **state,
+                    "context": context,
+                    "sources": sources,
+                    "current_step": "create_context",
+                    "steps_completed": state.get("steps_completed", []) + ["create_context"]
+                }
+
+            def generate_answer(state: RAGState) -> RAGState:
+                """Step 4: 답변 생성"""
+                print("   🤖 [4/4] 답변 생성 중...")
+                query = state["query"]
+                context = state.get("context", "")
+                answer = ""
+
+                if llm and context:
+                    try:
+                        if self.language == 'ko':
+                            system_msg = "당신은 의학/과학 논문을 기반으로 질문에 답변하는 전문가입니다. 제공된 문맥을 바탕으로 한국어로 답변해주세요."
+                        else:
+                            system_msg = "You are an expert answering questions based on medical/scientific papers. Answer based on the provided context."
+
+                        from langchain_core.messages import SystemMessage, HumanMessage
+                        messages = [
+                            SystemMessage(content=system_msg),
+                            HumanMessage(content=f"Context:\n{context}\n\nQuestion: {query}")
+                        ]
+                        response = llm.invoke(messages)
+                        answer = response.content
+                    except Exception as e:
+                        answer = f"답변 생성 오류: {str(e)[:50]}"
+                else:
+                    answer = "컨텍스트가 없거나 LLM이 설정되지 않았습니다."
+
+                self.workflow_history.append({
+                    "step": "generate_answer",
+                    "input": query,
+                    "output": answer[:100] + "...",
+                    "status": "completed"
+                })
+
+                return {
+                    **state,
+                    "answer": answer,
+                    "current_step": "generate_answer",
+                    "steps_completed": state.get("steps_completed", []) + ["generate_answer"]
+                }
+
+            # 그래프 생성
+            workflow = StateGraph(RAGState)
+
+            # 노드 추가
+            workflow.add_node("process_query", process_query)
+            workflow.add_node("retrieve_documents", retrieve_documents)
+            workflow.add_node("create_context", create_context)
+            workflow.add_node("generate_answer", generate_answer)
+
+            # 엣지 추가 (순차 실행)
+            workflow.set_entry_point("process_query")
+            workflow.add_edge("process_query", "retrieve_documents")
+            workflow.add_edge("retrieve_documents", "create_context")
+            workflow.add_edge("create_context", "generate_answer")
+            workflow.add_edge("generate_answer", END)
+
+            # 그래프 컴파일
+            self.graph = workflow.compile()
+            print("✅ LangGraph RAG 워크플로우 생성 완료!")
+
+            return self.graph
+
+        except ImportError as e:
+            print(f"⚠️ LangGraph 패키지 설치 필요: pip install langgraph langchain-openai")
+            print(f"   오류: {str(e)[:50]}")
+            return None
+        except Exception as e:
+            print(f"⚠️ 그래프 생성 실패: {str(e)}")
+            return None
+
+    def invoke(self, query: str) -> Dict:
+        """워크플로우 실행"""
+        if not self.graph:
+            self.build_graph()
+
+        if not self.graph:
+            return {"error": "그래프를 생성할 수 없습니다."}
+
+        self.workflow_history = []
+
+        print("\n" + "=" * 50)
+        print("🔄 LangGraph RAG 워크플로우 실행")
+        print("=" * 50)
+
+        # LangSmith 트레이싱
+        with LangSmithTracer("LangGraph_RAG_Workflow", run_type="chain",
+                            metadata={"query": query}) as tracer:
+            tracer.log_input({"query": query})
+
+            initial_state = {
+                "query": query,
+                "query_processed": "",
+                "documents": [],
+                "context": "",
+                "answer": "",
+                "sources": [],
+                "current_step": "start",
+                "steps_completed": [],
+                "error": ""
+            }
+
+            try:
+                result = self.graph.invoke(initial_state)
+                tracer.log_output({
+                    "answer": result.get("answer", "")[:200],
+                    "sources_count": len(result.get("sources", []))
+                })
+                return result
+            except Exception as e:
+                error_msg = str(e)
+                tracer.log_output({"error": error_msg})
+                return {"error": error_msg}
+
+    def get_workflow_status(self) -> List[Dict]:
+        """워크플로우 진행 상태 반환"""
+        return self.workflow_history
+
+    def print_workflow_status(self):
+        """워크플로우 상태 출력"""
+        print("\n" + "-" * 50)
+        print("📊 워크플로우 진행 상태")
+        print("-" * 50)
+
+        steps = ["process_query", "retrieve_documents", "create_context", "generate_answer"]
+        step_names = {
+            "process_query": "쿼리 처리",
+            "retrieve_documents": "문서 검색",
+            "create_context": "컨텍스트 생성",
+            "generate_answer": "답변 생성"
+        }
+
+        for step in steps:
+            history_item = next((h for h in self.workflow_history if h["step"] == step), None)
+            if history_item:
+                status = "✅" if history_item["status"] == "completed" else "❌"
+                print(f"   {status} {step_names[step]}: {history_item['output'][:50]}")
+            else:
+                print(f"   ⏳ {step_names[step]}: 대기 중")
+
+        print("-" * 50)
+
+    def visualize_graph(self):
+        """그래프 시각화 (Mermaid 형식)"""
+        if not self.graph:
+            print("⚠️ 그래프가 생성되지 않았습니다.")
+            return
+
+        print("\n" + "=" * 50)
+        print("📊 LangGraph RAG 워크플로우 다이어그램")
+        print("=" * 50)
+        print("""
+        ┌─────────────────┐
+        │   START         │
+        └────────┬────────┘
+                 │
+                 ▼
+        ┌─────────────────┐
+        │ process_query   │  ← 쿼리 처리 & 번역
+        └────────┬────────┘
+                 │
+                 ▼
+        ┌─────────────────┐
+        │retrieve_documents│ ← 벡터 DB 검색
+        └────────┬────────┘
+                 │
+                 ▼
+        ┌─────────────────┐
+        │ create_context  │  ← 컨텍스트 구성
+        └────────┬────────┘
+                 │
+                 ▼
+        ┌─────────────────┐
+        │ generate_answer │  ← LLM 답변 생성
+        └────────┬────────┘
+                 │
+                 ▼
+        ┌─────────────────┐
+        │      END        │
+        └─────────────────┘
+        """)
+
+    def chat(self):
+        """대화형 LangGraph RAG 세션"""
+        print("\n" + "=" * 60)
+        print("🔄 LangGraph RAG 대화 모드")
+        print("=" * 60)
+        print("   명령어:")
+        print("   - 'status': 워크플로우 상태 보기")
+        print("   - 'graph': 그래프 다이어그램 보기")
+        print("   - 'quit': 종료")
+        print("-" * 60)
+
+        while True:
+            query = input("\n🧑 질문: ").strip()
+
+            if query.lower() in ['quit', 'exit', 'q']:
+                print("\n👋 세션 종료")
+                break
+            if query.lower() == 'status':
+                self.print_workflow_status()
+                continue
+            if query.lower() == 'graph':
+                self.visualize_graph()
+                continue
+            if not query:
+                continue
+
+            result = self.invoke(query)
+
+            if result.get("error"):
+                print(f"\n❌ 오류: {result['error']}")
+            else:
+                print(f"\n🤖 답변:\n{result.get('answer', 'No answer')}")
+                if result.get('sources'):
+                    print(f"\n📚 참고 문서:")
+                    for i, src in enumerate(result['sources'][:3], 1):
+                        print(f"   [{i}] {src[:50]}...")
+
+            self.print_workflow_status()
+
+
 # ==================== 논문 요약 클래스 ====================
 class PaperSummarizer:
     """OpenAI API를 사용한 논문 요약"""
@@ -3820,6 +4170,100 @@ def run_agent_mode():
         print("   필요 패키지: pip install langchain langchain-openai langchainhub")
 
 
+# ==================== LangGraph 모드 실행 ====================
+def run_langgraph_mode():
+    """LangGraph RAG 워크플로우 모드 실행"""
+    print("\n" + "=" * 60)
+    print("🔄 LangGraph RAG 워크플로우 모드")
+    print("=" * 60)
+
+    # .env에서 API 키 로드
+    openai_api_key = os.getenv('OPENAI_API_KEY')
+    langchain_api_key = os.getenv('LANGCHAIN_API_KEY')
+
+    if not openai_api_key:
+        print("\n❌ OpenAI API 키가 필요합니다.")
+        print("   .env 파일에 OPENAI_API_KEY를 설정해주세요.")
+        return
+
+    print("   ✅ OpenAI API 연결됨")
+
+    # LangSmith 설정
+    if langchain_api_key:
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        os.environ["LANGCHAIN_PROJECT"] = "langgraph-rag-workflow"
+        os.environ["LANGCHAIN_API_KEY"] = langchain_api_key
+        print("   ✅ LangSmith 추적 활성화")
+        print(f"   📊 대시보드: https://smith.langchain.com")
+
+    # RAG 시스템 구축
+    print("\n⚙️ RAG 시스템 설정 중...")
+
+    search_query = input("🔍 검색할 논문 키워드: ").strip() or "medical research"
+    max_results = 5
+
+    # 언어 감지
+    language = detect_language(search_query)
+    if language == 'ko':
+        search_query_en = translate_to_english(search_query, openai_api_key)
+        print(f"   🇺🇸 번역: {search_query_en}")
+    else:
+        search_query_en = search_query
+
+    # 논문 검색
+    print("\n📚 논문 검색 중...")
+    searcher = PaperSearcher(
+        api_key=os.getenv('PUBMED_API_KEY'),
+        email=os.getenv('PUBMED_EMAIL')
+    )
+    papers = searcher.search(search_query_en, 'pubmed', max_results)
+    print(f"   📄 {len(papers)}개 논문 발견")
+
+    if not papers:
+        print("❌ 논문을 찾을 수 없습니다.")
+        return
+
+    # 다운로드 및 텍스트 추출
+    print("\n📥 논문 다운로드 중...")
+    downloader = PDFDownloader(PAPERS_DIR)
+    downloaded = downloader.download_all(papers)
+
+    if not downloaded:
+        print("❌ 다운로드된 파일이 없습니다.")
+        return
+
+    print("\n📄 텍스트 추출 중...")
+    documents = TextExtractor.extract_all(downloaded)
+
+    if not documents:
+        print("❌ 추출된 텍스트가 없습니다.")
+        return
+
+    # 임베딩 및 RAG 시스템 구축
+    print("\n🧠 RAG 시스템 구축 중...")
+    embeddings = EmbeddingModelFactory.create('minilm')
+    rag_system = RAGSystem(embeddings, language=language)
+    rag_system.build_vectorstore(documents)
+
+    # LangGraph RAG 워크플로우 생성
+    print("\n🔄 LangGraph 워크플로우 생성 중...")
+    langgraph_rag = LangGraphRAG(
+        openai_api_key=openai_api_key,
+        rag_system=rag_system,
+        language=language
+    )
+
+    if langgraph_rag.build_graph():
+        # 그래프 시각화
+        langgraph_rag.visualize_graph()
+
+        # 대화 모드
+        langgraph_rag.chat()
+    else:
+        print("\n❌ LangGraph 워크플로우 생성에 실패했습니다.")
+        print("   필요 패키지: pip install langgraph langchain-openai")
+
+
 # ==================== 트렌드 분석 실행 ====================
 def run_trend_analysis():
     """트렌드 분석 모드 실행"""
@@ -3905,6 +4349,7 @@ def main():
     print("   1. RAG 시스템 (논문 검색 + 질의응답)")
     print("   2. 트렌드 분석 (키워드 기반 연구 동향)")
     print("   3. Agent 모드 (LangChain Agent 대화)")
+    print("   4. LangGraph 모드 (워크플로우 기반 RAG)")
     mode = input("선택 [1]: ").strip() or "1"
 
     if mode == "2":
@@ -3915,6 +4360,11 @@ def main():
     if mode == "3":
         # Agent 모드
         run_agent_mode()
+        return
+
+    if mode == "4":
+        # LangGraph 모드
+        run_langgraph_mode()
         return
 
     # 1. 대화형 설정
