@@ -152,6 +152,7 @@ class Config:
         self.openai_api_key = os.getenv('OPENAI_API_KEY') or None
         self.anthropic_api_key = os.getenv('ANTHROPIC_API_KEY') or None
         self.language = 'en'  # 감지된 언어
+        self.summary_language = 'ko'  # 요약 출력 언어 (ko: 한국어, en: English)
 
     def interactive_setup(self):
         """대화형 설정"""
@@ -159,13 +160,26 @@ class Config:
         print("⚙️  RAG 시스템 설정")
         print("=" * 60)
 
-        # 검색 소스 선택
-        print("\n📖 검색 소스 선택:")
-        print("   1. PubMed (의학/생물학)")
-        print("   2. arXiv (CS/물리/수학)")
-        print("   3. 둘 다")
+        # 검색 소스 선택 (복수 선택 가능)
+        print("\n📖 검색 소스 선택 (복수 선택: 콤마로 구분, 예: 1,2,3):")
+        print("   1. PubMed (의학/생물학, NCBI)")
+        print("   2. arXiv (CS/물리/수학, 프리프린트)")
+        print("   3. Europe PMC (유럽 의학/생명과학, Open Access)")
+        print("   4. 전체 (PubMed + arXiv + Europe PMC)")
         choice = input("선택 [1]: ").strip() or "1"
-        self.search_source = {'1': 'pubmed', '2': 'arxiv', '3': 'both'}.get(choice, 'pubmed')
+
+        # 복수 선택 처리
+        source_map = {'1': 'pubmed', '2': 'arxiv', '3': 'europepmc', '4': 'all'}
+        if ',' in choice:
+            # 콤마로 구분된 복수 선택
+            selected = []
+            for c in choice.split(','):
+                c = c.strip()
+                if c in source_map:
+                    selected.append(source_map[c])
+            self.search_source = ','.join(selected) if selected else 'pubmed'
+        else:
+            self.search_source = source_map.get(choice, 'pubmed')
 
         # 검색어 입력
         self.search_query = input("\n🔍 검색어 입력: ").strip()
@@ -177,6 +191,15 @@ class Config:
         self.language = detect_language(self.search_query)
         lang_name = "한국어" if self.language == 'ko' else "English"
         print(f"   🌐 감지된 언어: {lang_name}")
+
+        # 요약 출력 언어 선택
+        print("\n🌍 요약 출력 언어 선택:")
+        print("   1. 한국어 (Korean) [기본값]")
+        print("   2. English")
+        summary_lang_choice = input("선택 [1]: ").strip() or "1"
+        self.summary_language = 'en' if summary_lang_choice == '2' else 'ko'
+        summary_lang_name = "한국어" if self.summary_language == 'ko' else "English"
+        print(f"   ✓ 요약 언어: {summary_lang_name}")
 
         # 최대 결과 수
         max_res = input(f"\n📄 최대 논문 수 [{self.max_results}]: ").strip()
@@ -1094,14 +1117,93 @@ class LangGraphRAG:
 
 # ==================== 논문 요약 클래스 ====================
 class PaperSummarizer:
-    """OpenAI API를 사용한 논문 요약"""
+    """OpenAI API를 사용한 논문 요약 (Full PDF vs Abstract 구분)"""
 
-    def __init__(self, api_key: str = None, language: str = 'en'):
+    def __init__(self, api_key: str = None, language: str = 'en', summary_language: str = 'ko'):
         self.api_key = api_key
         self.language = language
+        self.summary_language = summary_language  # 요약 출력 언어
+
+    def _is_full_paper(self, paper: Dict, documents: List[Dict]) -> tuple:
+        """
+        논문이 Full PDF인지 Abstract만인지 확인
+
+        Returns:
+            (is_full: bool, content: str, source_file: str)
+        """
+        paper_content = ""
+        source_file = ""
+
+        for doc in documents:
+            if paper['id'] in doc['source']:
+                paper_content = doc['text']
+                source_file = doc['source']
+                break
+
+        # Full PDF 판단 기준:
+        # 1. 내용 길이가 2000자 이상
+        # 2. Abstract 외의 내용이 포함됨 (Introduction, Methods, Results 등)
+        is_full = len(paper_content) > 2000
+
+        # 추가 확인: 논문 구조 키워드 존재 여부
+        structure_keywords = ['introduction', 'methods', 'results', 'discussion',
+                            'conclusion', 'references', 'materials', 'background']
+        content_lower = paper_content.lower()
+        has_structure = sum(1 for kw in structure_keywords if kw in content_lower) >= 2
+
+        is_full = is_full and has_structure
+
+        return is_full, paper_content, source_file
+
+    def _get_paper_urls(self, paper: Dict) -> Dict[str, str]:
+        """논문 관련 URL 수집"""
+        urls = {}
+
+        if paper.get('pubmed_url'):
+            urls['PubMed'] = paper['pubmed_url']
+        if paper.get('pmc_url'):
+            urls['PMC (Full Text)'] = paper['pmc_url']
+        if paper.get('europepmc_url'):
+            urls['Europe PMC'] = paper['europepmc_url']
+        if paper.get('pdf_url'):
+            urls['PDF'] = paper['pdf_url']
+        if paper.get('doi'):
+            urls['DOI'] = f"https://doi.org/{paper['doi']}"
+
+        # PubMed ID로 URL 생성
+        if paper.get('id') and paper['id'].startswith('PMID_'):
+            pmid = paper['id'].replace('PMID_', '')
+            if 'PubMed' not in urls:
+                urls['PubMed'] = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+            if 'Europe PMC' not in urls:
+                urls['Europe PMC'] = f"https://europepmc.org/article/MED/{pmid}"
+
+        # PMC ID로 URL 생성
+        if paper.get('id') and paper['id'].startswith('PMC_'):
+            pmcid = paper['id'].replace('PMC_', '')
+            if 'PMC (Full Text)' not in urls:
+                urls['PMC (Full Text)'] = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/"
+            if 'Europe PMC' not in urls:
+                urls['Europe PMC'] = f"https://europepmc.org/article/PMC/{pmcid}"
+
+        # Google Scholar 검색 링크
+        urls['Google Scholar'] = f"https://scholar.google.com/scholar?q={paper['title'][:50].replace(' ', '+')}"
+
+        # arXiv
+        if paper.get('source') == 'arXiv' and paper.get('id'):
+            arxiv_id = paper['id']
+            urls['arXiv'] = f"https://arxiv.org/abs/{arxiv_id}"
+            urls['arXiv PDF'] = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+
+        # Europe PMC
+        if paper.get('source') == 'Europe PMC':
+            if paper.get('is_open_access'):
+                urls['🔓 Open Access'] = paper.get('europepmc_url', '')
+
+        return urls
 
     def summarize(self, papers: List[Dict], documents: List[Dict]) -> List[Dict]:
-        """논문들을 요약"""
+        """논문들을 요약 (Full PDF는 AI 요약, Abstract만 있으면 링크 제공)"""
         if not self.api_key:
             print("\n⚠️ OpenAI API 키가 없어 요약을 건너뜁니다.")
             return papers
@@ -1109,7 +1211,6 @@ class PaperSummarizer:
         print("\n" + "=" * 60)
         print("📝 논문 요약 (OpenAI API)")
         print("=" * 60)
-        print(f"   📚 총 {len(papers)}개 논문 요약 예정\n")
 
         try:
             from openai import OpenAI
@@ -1121,48 +1222,147 @@ class PaperSummarizer:
             print(f"⚠️ OpenAI 초기화 실패: {str(e)[:50]}")
             return papers
 
-        # 언어별 프롬프트
+        # 논문 분류
+        full_papers = []
+        abstract_only = []
+
+        for paper in papers:
+            is_full, content, source = self._is_full_paper(paper, documents)
+            paper['_is_full_paper'] = is_full
+            paper['_content'] = content
+            paper['_urls'] = self._get_paper_urls(paper)
+
+            if is_full:
+                full_papers.append(paper)
+            else:
+                abstract_only.append(paper)
+
+        print(f"   📄 Full Paper (AI 요약): {len(full_papers)}개")
+        print(f"   📋 Abstract Only (링크 제공): {len(abstract_only)}개\n")
+
+        # 언어별 프롬프트 (Full Paper용)
         if self.language == 'ko':
             system_prompt = """당신은 의학/과학 논문을 요약하는 전문가입니다.
-논문의 제목, 저자, 초록, 본문 내용을 바탕으로 핵심 내용을 한국어로 간결하게 요약해주세요.
+논문의 전체 내용을 바탕으로 핵심 내용을 한국어로 상세하게 요약해주세요.
 요약은 다음 형식을 따르세요:
-- 연구 목적
-- 주요 방법
-- 핵심 결과
-- 결론 및 의의"""
+- 연구 목적: 이 연구가 해결하려는 문제
+- 주요 방법: 사용된 실험/분석 방법
+- 핵심 결과: 가장 중요한 발견 (수치 포함)
+- 결론 및 의의: 연구의 의미와 향후 전망"""
         else:
             system_prompt = """You are an expert at summarizing medical/scientific papers.
-Based on the title, authors, abstract, and content, provide a concise summary.
+Based on the full paper content, provide a detailed summary.
 Follow this format:
-- Research Objective
-- Key Methods
-- Main Results
-- Conclusion & Significance"""
+- Research Objective: The problem this research addresses
+- Key Methods: Experimental/analytical methods used
+- Main Results: Most important findings (include numbers)
+- Conclusion & Significance: Implications and future directions"""
 
         summarized_papers = []
-        success_count = 0
-        fail_count = 0
+        full_success = 0
+        full_fail = 0
 
-        # tqdm 진행 바로 요약 진행 상황 표시
-        with tqdm(
-            total=len(papers),
-            desc="   🤖 AI 요약 생성",
-            bar_format='{desc}: {percentage:3.0f}%|{bar:25}| {n}/{total} [{elapsed}<{remaining}]',
-            colour='cyan'
-        ) as pbar:
-            for i, paper in enumerate(papers):
-                title_short = paper['title'][:35] + "..." if len(paper['title']) > 35 else paper['title']
-                pbar.set_postfix_str(f"📄 {title_short}")
+        # Full Paper AI 요약
+        if full_papers:
+            print("-" * 60)
+            print("🤖 Full Paper AI 요약 진행")
+            print("-" * 60)
 
-                # 해당 논문의 본문 찾기
-                paper_content = ""
-                for doc in documents:
-                    if paper['id'] in doc['source']:
-                        paper_content = doc['text'][:3000]  # 토큰 제한
-                        break
+            with tqdm(
+                total=len(full_papers),
+                desc="   🤖 AI 요약 생성",
+                bar_format='{desc}: {percentage:3.0f}%|{bar:25}| {n}/{total} [{elapsed}<{remaining}]',
+                colour='cyan'
+            ) as pbar:
+                for paper in full_papers:
+                    title_short = paper['title'][:35] + "..." if len(paper['title']) > 35 else paper['title']
+                    pbar.set_postfix_str(f"📄 {title_short}")
 
-                # 요약할 내용 구성
-                content_to_summarize = f"""
+                    content_to_summarize = f"""
+Title: {paper['title']}
+Authors: {', '.join(paper['authors'][:5])}
+Published: {paper['published']}
+Source: {paper['source']}
+
+Full Paper Content:
+{paper['_content'][:6000]}
+"""
+
+                    try:
+                        with LangSmithTracer("Paper_Summary_LLM", run_type="llm",
+                                            metadata={"paper_title": paper['title'][:50], "type": "full_paper"}) as tracer:
+                            tracer.log_input({"system": system_prompt, "user": content_to_summarize[:500]})
+
+                            response = client.chat.completions.create(
+                                model="gpt-3.5-turbo",
+                                messages=[
+                                    {"role": "system", "content": system_prompt},
+                                    {"role": "user", "content": content_to_summarize}
+                                ],
+                                max_tokens=800,  # Full paper는 더 긴 요약
+                                temperature=0.3
+                            )
+
+                            summary = response.choices[0].message.content
+                            paper['summary'] = summary
+                            paper['summary_type'] = 'full_paper'
+                            full_success += 1
+
+                            tracer.log_output({"summary": summary[:200]})
+
+                    except Exception as e:
+                        paper['summary'] = f"[요약 실패 - 초록 원문]\n{paper['abstract']}"
+                        paper['summary_type'] = 'fallback'
+                        full_fail += 1
+
+                    summarized_papers.append(paper)
+                    pbar.update(1)
+                    time.sleep(0.5)
+
+        # Abstract Only 처리 (AI 요약으로 선택된 언어로 변환)
+        abstract_success = 0
+        abstract_fail = 0
+
+        if abstract_only:
+            # 선택된 언어에 따른 출력 메시지
+            lang_label = "한국어" if self.summary_language == 'ko' else "English"
+            print("\n" + "-" * 60)
+            print(f"📋 Abstract Only 논문 → AI {lang_label} 요약")
+            print("-" * 60)
+
+            # Abstract용 프롬프트 (선택된 언어로 요약)
+            if self.summary_language == 'ko':
+                abstract_prompt = """당신은 의학/과학 논문 초록을 요약하고 번역하는 전문가입니다.
+아래 논문의 초록(Abstract)을 한국어로 번역하고 핵심 내용을 요약해주세요.
+
+요약 형식:
+- 연구 배경: 이 연구의 배경과 필요성
+- 연구 방법: 사용된 주요 방법론
+- 주요 결과: 핵심 발견 사항
+- 결론: 연구의 의의와 시사점"""
+            else:
+                abstract_prompt = """You are an expert at summarizing medical/scientific paper abstracts.
+Summarize the key points of the following abstract.
+
+Format:
+- Background: Research context and motivation
+- Methods: Key methodology used
+- Results: Main findings
+- Conclusion: Implications and significance"""
+
+            # 진행 바 설명 (선택된 언어에 따라)
+            pbar_desc = "   🌐 한국어 변환" if self.summary_language == 'ko' else "   🌐 English Summary"
+            with tqdm(
+                total=len(abstract_only),
+                desc=pbar_desc,
+                bar_format='{desc}: {percentage:3.0f}%|{bar:25}| {n}/{total} [{elapsed}<{remaining}]',
+                colour='green'
+            ) as pbar:
+                for paper in abstract_only:
+                    title_short = paper['title'][:35] + "..." if len(paper['title']) > 35 else paper['title']
+                    pbar.set_postfix_str(f"📋 {title_short}")
+
+                    abstract_content = f"""
 Title: {paper['title']}
 Authors: {', '.join(paper['authors'][:5])}
 Published: {paper['published']}
@@ -1170,49 +1370,49 @@ Source: {paper['source']}
 
 Abstract:
 {paper['abstract']}
-
-Content:
-{paper_content}
 """
 
-                try:
-                    # LangSmith 트레이싱
-                    with LangSmithTracer("Paper_Summary_LLM", run_type="llm",
-                                        metadata={"paper_title": paper['title'][:50]}) as tracer:
-                        tracer.log_input({"system": system_prompt, "user": content_to_summarize[:500]})
+                    try:
+                        with LangSmithTracer("Abstract_Summary_LLM", run_type="llm",
+                                            metadata={"paper_title": paper['title'][:50], "type": "abstract"}) as tracer:
+                            tracer.log_input({"system": abstract_prompt, "user": abstract_content[:500]})
 
-                        response = client.chat.completions.create(
-                            model="gpt-3.5-turbo",
-                            messages=[
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": content_to_summarize}
-                            ],
-                            max_tokens=500,
-                            temperature=0.3
-                        )
+                            response = client.chat.completions.create(
+                                model="gpt-3.5-turbo",
+                                messages=[
+                                    {"role": "system", "content": abstract_prompt},
+                                    {"role": "user", "content": abstract_content}
+                                ],
+                                max_tokens=500,
+                                temperature=0.3
+                            )
 
-                        summary = response.choices[0].message.content
-                        paper['summary'] = summary
-                        success_count += 1
+                            summary = response.choices[0].message.content
+                            paper['summary'] = summary
+                            paper['summary_type'] = 'abstract_summarized'
+                            abstract_success += 1
 
-                        tracer.log_output({"summary": summary[:200]})
+                            tracer.log_output({"summary": summary[:200]})
 
-                except Exception as e:
-                    # 실패 시 전체 초록 사용
-                    paper['summary'] = f"[초록 원문]\n{paper['abstract']}"
-                    fail_count += 1
+                    except Exception as e:
+                        # 실패 시 원본 초록 사용
+                        paper['summary'] = f"[번역 실패 - 원문]\n{paper['abstract']}"
+                        paper['summary_type'] = 'abstract_only'
+                        abstract_fail += 1
 
-                summarized_papers.append(paper)
-                pbar.update(1)
-                time.sleep(0.5)  # API 속도 제한
+                    summarized_papers.append(paper)
+                    pbar.update(1)
+                    time.sleep(0.3)
 
-        # 요약 결과 통계
+        # 결과 통계
+        summary_lang_label = "한국어" if self.summary_language == 'ko' else "English"
         print("\n" + "-" * 60)
         print("📊 요약 결과 통계")
         print("-" * 60)
-        print(f"   ✅ 요약 성공: {success_count}개")
-        if fail_count > 0:
-            print(f"   ⚠️ 요약 실패: {fail_count}개 (초록으로 대체)")
+        if full_papers:
+            print(f"   📄 Full Paper AI 요약: {full_success}개 성공" + (f", {full_fail}개 실패" if full_fail > 0 else ""))
+        if abstract_only:
+            print(f"   📋 Abstract {summary_lang_label} 요약: {abstract_success}개 성공" + (f", {abstract_fail}개 실패" if abstract_fail > 0 else ""))
         print("-" * 60)
 
         # 요약 결과 출력
@@ -1222,22 +1422,58 @@ Content:
 
         for i, paper in enumerate(summarized_papers):
             print(f"\n{'─' * 70}")
-            print(f"📄 [{i+1}/{len(summarized_papers)}] {paper['title']}")
+            summary_type = paper.get('summary_type', 'unknown')
+
+            # 유형별 아이콘 및 라벨
+            if summary_type == 'full_paper':
+                type_icon = "📄"
+                type_label = "[Full Paper]"
+            elif summary_type == 'abstract_summarized':
+                type_icon = "📋"
+                type_label = f"[Abstract → {summary_lang_label}]"
+            else:
+                type_icon = "📋"
+                type_label = "[Abstract Only]"
+
+            print(f"{type_icon} [{i+1}/{len(summarized_papers)}] {type_label} {paper['title']}")
             print(f"{'─' * 70}")
             print(f"👤 저자: {', '.join(paper['authors'][:3])}" + (" 외" if len(paper['authors']) > 3 else ""))
             print(f"📅 발행: {paper['published'][:10] if paper.get('published') else 'N/A'}")
             print(f"📖 출처: {paper['source']}")
+
+            # 링크 출력
+            urls = paper.get('_urls', {})
+            if urls:
+                print(f"{'─' * 70}")
+                print("🔗 논문 링크:")
+                for name, url in urls.items():
+                    print(f"   • {name}: {url}")
+
             print(f"{'─' * 70}")
-            print("📝 요약:")
-            print()
-            # 요약 내용 전체 출력 (줄바꿈 유지)
+
+            if summary_type == 'full_paper':
+                print("📝 AI 요약 (전체 논문 기반):")
+            elif summary_type == 'abstract_summarized':
+                print(f"📝 AI {summary_lang_label} 요약 (초록 기반):")
+            else:
+                print("📝 초록 원문 (요약 실패):")
+                print("   ⚠️ 요약에 실패하여 원문을 표시합니다.")
+                print()
+
             summary = paper.get('summary', 'No summary available')
             for line in summary.split('\n'):
                 print(f"   {line}")
             print()
 
         print("=" * 70)
-        input("\n⏎ Enter를 눌러 다음 단계로 진행...")
+
+        # 비대화형 모드에서는 input 건너뛰기
+        try:
+            import sys
+            if sys.stdin.isatty():
+                input("\n⏎ Enter를 눌러 다음 단계로 진행...")
+        except:
+            pass
 
         return summarized_papers
 
@@ -1381,17 +1617,171 @@ class PaperSearcher:
             print(f"   ❌ PubMed 검색 오류: {str(e)}")
             return []
 
+    def search_europepmc(self, query: str, max_results: int = 5) -> List[Dict]:
+        """Europe PMC에서 논문 검색"""
+        print(f"\n🔍 Europe PMC에서 '{query}' 검색 중...")
+
+        search_url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+        params = {
+            'query': query,
+            'format': 'json',
+            'pageSize': max_results,
+            'resultType': 'core'  # 상세 정보 포함 (기본 정렬: relevance)
+        }
+
+        try:
+            response = requests.get(search_url, params=params, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+
+            results = data.get('resultList', {}).get('result', [])
+
+            if not results:
+                print("   ⚠️ Europe PMC: 검색 결과 없음")
+                return []
+
+            papers = []
+            for article in results:
+                try:
+                    # 기본 정보 추출
+                    title = article.get('title', 'No Title')
+                    if title:
+                        title = title.replace('<i>', '').replace('</i>', '')
+                        title = title.replace('<b>', '').replace('</b>', '')
+
+                    # 초록 추출
+                    abstract = article.get('abstractText', '')
+                    if not abstract:
+                        abstract = 'No abstract available'
+
+                    # 저자 정보
+                    author_string = article.get('authorString', '')
+                    if author_string:
+                        authors = [a.strip() for a in author_string.split(',')[:5]]
+                    else:
+                        authors = ['Unknown']
+
+                    # 출판 정보
+                    pub_year = article.get('pubYear', 'Unknown')
+
+                    # ID 및 URL
+                    pmid = article.get('pmid', '')
+                    pmcid = article.get('pmcid', '')
+                    doi = article.get('doi', '')
+                    source_db = article.get('source', 'MED')
+
+                    # ID 결정 (우선순위: PMCID > PMID > DOI)
+                    if pmcid:
+                        paper_id = f"PMC_{pmcid}"
+                    elif pmid:
+                        paper_id = f"PMID_{pmid}"
+                    elif doi:
+                        paper_id = f"DOI_{doi.replace('/', '_')}"
+                    else:
+                        paper_id = f"EPMC_{article.get('id', 'unknown')}"
+
+                    # URL 구성
+                    europepmc_url = None
+                    pdf_url = None
+                    pubmed_url = None
+                    pmc_url = None
+
+                    if pmcid:
+                        europepmc_url = f"https://europepmc.org/article/PMC/{pmcid}"
+                        pmc_url = f"https://www.ncbi.nlm.nih.gov/pmc/articles/{pmcid}/"
+                        # PMC 논문은 보통 무료 PDF 제공
+                        pdf_url = f"https://europepmc.org/backend/ptpmcrender.fcgi?accid={pmcid}&blobtype=pdf"
+                    elif pmid:
+                        europepmc_url = f"https://europepmc.org/article/MED/{pmid}"
+                        pubmed_url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+
+                    # 전문 접근 가능 여부
+                    is_open_access = article.get('isOpenAccess', 'N') == 'Y'
+                    has_full_text = article.get('hasFullText', 'N') == 'Y'
+
+                    paper = {
+                        'source': 'Europe PMC',
+                        'title': title,
+                        'authors': authors,
+                        'abstract': abstract,
+                        'pdf_url': pdf_url,
+                        'europepmc_url': europepmc_url,
+                        'pubmed_url': pubmed_url,
+                        'pmc_url': pmc_url,
+                        'doi': doi,
+                        'published': str(pub_year),
+                        'id': paper_id,
+                        'is_open_access': is_open_access,
+                        'has_full_text': has_full_text
+                    }
+                    papers.append(paper)
+
+                    # 상태 표시
+                    oa_icon = "🔓" if is_open_access else "🔒"
+                    print(f"   📄 {oa_icon} {paper['title'][:55]}...")
+
+                except Exception as e:
+                    continue
+
+            oa_count = sum(1 for p in papers if p.get('is_open_access'))
+            print(f"   ✅ Europe PMC: {len(papers)}개 논문 발견 (Open Access: {oa_count}개)")
+            return papers
+
+        except Exception as e:
+            print(f"   ❌ Europe PMC 검색 오류: {str(e)}")
+            return []
+
     def search(self, query: str, source: str = 'both', max_results: int = 5) -> List[Dict]:
+        """
+        논문 검색 (복수 소스 지원)
+
+        Args:
+            query: 검색어
+            source: 검색 소스 (콤마로 구분하여 복수 선택 가능)
+                    예: 'pubmed', 'arxiv', 'europepmc', 'pubmed,arxiv', 'all'
+            max_results: 소스당 최대 결과 수
+        """
         papers = []
 
-        if source in ['arxiv', 'both']:
+        # 소스 목록 파싱
+        if source == 'all' or source == 'both':
+            sources = ['pubmed', 'arxiv', 'europepmc']
+        else:
+            sources = [s.strip().lower() for s in source.split(',')]
+
+        # 각 소스에서 검색
+        if 'arxiv' in sources:
             papers.extend(self.search_arxiv(query, max_results))
 
-        if source in ['pubmed', 'both']:
+        if 'pubmed' in sources:
             papers.extend(self.search_pubmed(query, max_results))
 
-        self.papers = papers
-        return papers
+        if 'europepmc' in sources:
+            papers.extend(self.search_europepmc(query, max_results))
+
+        # 중복 제거 (PMID 기준)
+        seen_ids = set()
+        unique_papers = []
+        for paper in papers:
+            paper_id = paper.get('id', '')
+            # PMID가 같은 경우 중복으로 처리
+            pmid = None
+            if 'PMID_' in paper_id:
+                pmid = paper_id.replace('PMID_', '')
+            elif paper.get('pubmed_url'):
+                pmid = paper.get('pubmed_url', '').split('/')[-2]
+
+            check_id = pmid if pmid else paper_id
+
+            if check_id not in seen_ids:
+                seen_ids.add(check_id)
+                unique_papers.append(paper)
+
+        if len(papers) != len(unique_papers):
+            print(f"\n   🔄 중복 제거: {len(papers)}개 → {len(unique_papers)}개")
+
+        self.papers = unique_papers
+        return unique_papers
 
 
 # ==================== 트렌드 분석 클래스 ====================
@@ -2819,6 +3209,109 @@ class RAGSystem:
         print("-" * 60)
         return self.vectorstore
 
+    def build_vectorstore_from_abstracts(self, papers: List[Dict], append: bool = False) -> FAISS:
+        """
+        논문 검색 결과의 Abstract만으로 VectorDB 생성 (PDF 다운로드 없이)
+
+        Args:
+            papers: PaperSearcher.search()에서 반환된 논문 목록
+                   각 논문: {'title', 'abstract', 'source', 'authors', 'published', ...}
+            append: True면 기존 VectorDB에 추가, False면 새로 생성
+
+        Returns:
+            FAISS vectorstore
+        """
+        if append and self.vectorstore:
+            print("\n" + "=" * 60)
+            print("➕ 기존 VectorDB에 새 논문 추가")
+            print("=" * 60)
+        else:
+            print("\n" + "=" * 60)
+            print("🚀 Abstract 기반 벡터 DB 생성 (PDF 다운로드 생략)")
+            print("=" * 60)
+
+        if not papers:
+            raise ValueError("논문 목록이 비어있습니다!")
+
+        # Step 1: Abstract를 문서 형식으로 변환
+        print(f"\n📄 Step 1: {len(papers)}개 논문 Abstract 추출")
+        documents = []
+
+        for paper in papers:
+            abstract = paper.get('abstract', '')
+            title = paper.get('title', 'Unknown Title')
+            source = paper.get('source', 'Unknown')
+            authors = paper.get('authors', [])
+            published = paper.get('published', 'Unknown')
+            paper_id = paper.get('id', 'Unknown')
+
+            if not abstract or abstract == 'No abstract available':
+                print(f"   ⚠️ Abstract 없음: {title[:40]}...")
+                continue
+
+            # 논문 정보를 텍스트에 포함
+            full_text = f"Title: {title}\n\n"
+            if authors:
+                full_text += f"Authors: {', '.join(authors[:5])}\n"
+            full_text += f"Published: {published}\n"
+            full_text += f"Source: {source}\n\n"
+            full_text += f"Abstract:\n{abstract}"
+
+            documents.append({
+                'text': full_text,
+                'source': f"{source}_{paper_id}"
+            })
+            print(f"   ✅ {title[:50]}...")
+
+        print(f"   📊 총 {len(documents)}개 문서 생성")
+
+        if not documents:
+            raise ValueError("추출된 Abstract가 없습니다!")
+
+        # Step 2: VectorDB 생성 또는 추가
+        if append and self.vectorstore:
+            # 기존 VectorDB에 새 문서 추가
+            return self._append_to_vectorstore(documents)
+        else:
+            # 새로 생성
+            return self.build_vectorstore(documents)
+
+    def _append_to_vectorstore(self, documents: List[Dict]) -> FAISS:
+        """기존 VectorDB에 새 문서 추가"""
+        print("\n🔧 새 문서를 기존 VectorDB에 추가")
+
+        # 새 문서 청킹
+        all_chunks = []
+        all_metadata = []
+
+        for doc in documents:
+            chunks = self.text_splitter.split_text(doc['text'])
+            for i, chunk in enumerate(chunks):
+                all_chunks.append(chunk)
+                all_metadata.append({
+                    'source': doc['source'],
+                    'chunk_id': i
+                })
+
+        print(f"   📊 새 청크 수: {len(all_chunks)}개")
+
+        if not all_chunks:
+            print("   ⚠️ 추가할 청크가 없습니다.")
+            return self.vectorstore
+
+        # 새 VectorDB 생성
+        new_vectorstore = FAISS.from_texts(
+            texts=all_chunks,
+            embedding=self.embeddings,
+            metadatas=all_metadata
+        )
+
+        # 기존 VectorDB와 병합
+        self.vectorstore.merge_from(new_vectorstore)
+
+        print("   ✅ VectorDB 병합 완료!")
+        return self.vectorstore
+
     def save_vectorstore(self, path: str = VECTORSTORE_DIR):
         if self.vectorstore:
             self.vectorstore.save_local(path)
@@ -3322,11 +3815,12 @@ class QdrantHybridSearch:
         dense_range = dense_max - dense_min if dense_max > dense_min else 1.0
         sparse_range = sparse_max - sparse_min if sparse_max > sparse_min else 1.0
 
-        # 결과 통합
+        # 결과 통합 (source + chunk_id를 고유 키로 사용)
         doc_scores = {}
 
         for r in dense_results:
-            key = r['content'][:100]
+            # source + chunk_id 조합으로 고유 키 생성
+            key = f"{r['source']}_{r['chunk_id']}"
             dense_norm = (r['score'] - dense_min) / dense_range
             doc_scores[key] = {
                 'content': r['content'],
@@ -3339,7 +3833,8 @@ class QdrantHybridSearch:
             }
 
         for r in sparse_results:
-            key = r['content'][:100]
+            # source + chunk_id 조합으로 고유 키 생성
+            key = f"{r['source']}_{r['chunk_id']}"
             sparse_norm = (r['score'] - sparse_min) / sparse_range
 
             if key in doc_scores:
@@ -3788,6 +4283,7 @@ class HybridSearchSystem:
             results.append({
                 'content': self.chunks[idx]['content'],
                 'source': self.chunks[idx]['source'],
+                'chunk_idx': int(idx),  # 고유 청크 인덱스 추가
                 'score': float(scores[idx]),
                 'method': 'sparse (BM25)'
             })
@@ -3814,6 +4310,7 @@ class HybridSearchSystem:
             results.append({
                 'content': self.chunks[idx]['content'],
                 'source': self.chunks[idx]['source'],
+                'chunk_idx': int(idx),  # 고유 청크 인덱스 추가
                 'score': float(scores[idx]),
                 'method': 'sparse (SPLADE)'
             })
@@ -3822,8 +4319,20 @@ class HybridSearchSystem:
     def dense_search(self, query: str, k: int = 5) -> List[Dict]:
         """FAISS 기반 Dense 검색 (의미적 유사도)"""
         results = self.rag.search(query, k=k)
+
+        # 콘텐츠 → 청크 인덱스 맵핑 생성 (더 빠른 조회를 위해)
+        content_to_idx = {}
+        for idx, chunk in enumerate(self.chunks):
+            content_key = chunk['content'][:100]  # 처음 100자로 키 생성
+            if content_key not in content_to_idx:
+                content_to_idx[content_key] = idx
+
         for r in results:
             r['method'] = 'dense'
+            # 청크 인덱스 찾기
+            content_key = r['content'][:100]
+            r['chunk_idx'] = content_to_idx.get(content_key, -1)
+
         return results
 
     def hybrid_search(
@@ -3867,12 +4376,14 @@ class HybridSearchSystem:
         dense_min = min(dense_scores) if dense_scores else 0.0
         dense_range = dense_max - dense_min if dense_max > dense_min else 1.0
 
-        # 문서 통합을 위한 딕셔너리
+        # 문서 통합을 위한 딕셔너리 (chunk_idx를 고유 키로 사용)
         doc_data = {}
 
         # Sparse 결과 처리 - 순위 기반 점수 + BM25 정규화
         for rank, r in enumerate(sparse_results):
-            key = r['content'][:100]
+            # chunk_idx를 고유 키로 사용 (없으면 content[:100] 사용)
+            chunk_idx = r.get('chunk_idx', -1)
+            key = f"chunk_{chunk_idx}" if chunk_idx >= 0 else r['content'][:100]
             sparse_rrf = 1.0 / (rrf_k + rank + 1)  # RRF 점수
             # BM25 점수를 0-1로 정규화
             bm25_norm = (r['score'] - bm25_min) / bm25_range if bm25_range > 0 else 1.0
@@ -3881,6 +4392,7 @@ class HybridSearchSystem:
                 doc_data[key] = {
                     'content': r['content'],
                     'source': r['source'],
+                    'chunk_idx': chunk_idx,
                     'sparse_rank': rank + 1,
                     'sparse_score': r['score'],  # 원본 BM25 점수 (0~30+ 범위)
                     'sparse_score_norm': bm25_norm,  # 정규화된 BM25 (0-1)
@@ -3898,7 +4410,9 @@ class HybridSearchSystem:
 
         # Dense 결과 처리 - 순위 기반 점수 + 거리 정규화
         for rank, r in enumerate(dense_results):
-            key = r['content'][:100]
+            # chunk_idx를 고유 키로 사용 (없으면 content[:100] 사용)
+            chunk_idx = r.get('chunk_idx', -1)
+            key = f"chunk_{chunk_idx}" if chunk_idx >= 0 else r['content'][:100]
             dense_rrf = 1.0 / (rrf_k + rank + 1)  # RRF 점수
             # L2 거리를 유사도로 변환 (1 - 정규화된 거리)
             dense_norm = 1.0 - ((r['score'] - dense_min) / dense_range) if dense_range > 0 else 1.0
@@ -3907,6 +4421,7 @@ class HybridSearchSystem:
                 doc_data[key] = {
                     'content': r['content'],
                     'source': r['source'],
+                    'chunk_idx': chunk_idx,
                     'sparse_rank': 0,
                     'sparse_score': 0,
                     'sparse_score_norm': 0,
@@ -4098,23 +4613,31 @@ class HybridSearchSystem:
 
 
 # ==================== 대화형 질의응답 ====================
-def interactive_qa(rag: RAGSystem, openai_api_key: str = None):
-    """대화형 질의응답 모드"""
+def interactive_qa(rag: RAGSystem, openai_api_key: str = None, config=None):
+    """대화형 질의응답 모드 (검색분야/검색내용 선택 가능)"""
 
     # 언어별 메시지
     if rag.language == 'ko':
         print("\n" + "=" * 60)
-        print("💬 대화형 질의응답 모드")
+        print("💬 RAG 질의응답 모드")
         print("=" * 60)
-        print("질문을 입력하세요. 종료하려면 'quit', 'exit', 'q'를 입력하세요.")
-        prompt_text = "❓ 질문: "
+        print("📋 명령어:")
+        print("   • 검색내용 입력: VectorDB에서 관련 문서 검색")
+        print("   • '/분야' 또는 '/field': 새로운 검색분야 추가")
+        print("   • '/info': 현재 VectorDB 정보 확인")
+        print("   • 'quit', 'exit', 'q': 종료")
+        prompt_text = "🔎 검색내용: "
         exit_msg = "👋 질의응답을 종료합니다."
     else:
         print("\n" + "=" * 60)
-        print("💬 Interactive Q&A Mode")
+        print("💬 RAG Q&A Mode")
         print("=" * 60)
-        print("Enter your question. Type 'quit', 'exit', or 'q' to exit.")
-        prompt_text = "❓ Question: "
+        print("📋 Commands:")
+        print("   • Enter query: Search from VectorDB")
+        print("   • '/field': Add new search field (papers)")
+        print("   • '/info': Show VectorDB info")
+        print("   • 'quit', 'exit', 'q': Exit")
+        prompt_text = "🔎 Query: "
         exit_msg = "👋 Exiting Q&A mode."
 
     print("-" * 60)
@@ -4138,6 +4661,72 @@ def interactive_qa(rag: RAGSystem, openai_api_key: str = None):
             if question.lower() in ['quit', 'exit', 'q', '종료', '끝']:
                 print(f"\n{exit_msg}")
                 break
+
+            # /info 명령어: VectorDB 정보 확인
+            if question.lower() in ['/info', '/정보']:
+                chunks = rag.get_all_chunks()
+                print("\n" + "=" * 50)
+                print("📊 현재 VectorDB 정보")
+                print("=" * 50)
+                print(f"   • 저장된 청크 수: {len(chunks)}개")
+                if chunks:
+                    sources = list(set([c.get('source', 'Unknown') for c in chunks]))
+                    print(f"   • 논문 수: {len(sources)}개")
+                    print(f"   • 출처 목록:")
+                    for src in sources[:10]:
+                        print(f"      - {src[:60]}...")
+                    if len(sources) > 10:
+                        print(f"      ... 외 {len(sources) - 10}개")
+                print("=" * 50)
+                continue
+
+            # /분야 또는 /field 명령어: 새로운 검색분야 추가
+            if question.lower() in ['/분야', '/field', '/검색분야']:
+                print("\n" + "=" * 50)
+                print("📚 새로운 검색분야 추가")
+                print("=" * 50)
+
+                new_field = input("🔍 검색분야 (논문 검색 키워드): ").strip()
+                if not new_field:
+                    print("   ⚠️ 검색분야가 입력되지 않았습니다.")
+                    continue
+
+                max_papers = input("📄 최대 논문 수 [5]: ").strip()
+                max_papers = int(max_papers) if max_papers.isdigit() else 5
+
+                # 검색분야 언어 감지 및 번역
+                field_lang = detect_language(new_field)
+                search_field = new_field
+                if field_lang == 'ko':
+                    search_field = translate_to_english(new_field, openai_api_key)
+                    print(f"   🔄 번역: '{new_field}' → '{search_field}'")
+
+                # 논문 검색
+                print(f"\n🔎 '{search_field}' 검색 중...")
+                searcher = PaperSearcher(
+                    api_key=os.getenv('PUBMED_API_KEY'),
+                    email=os.getenv('PUBMED_EMAIL')
+                )
+                new_papers = searcher.search(
+                    query=search_field,
+                    source='pubmed',
+                    max_results=max_papers
+                )
+
+                if not new_papers:
+                    print("   ❌ 논문을 찾을 수 없습니다.")
+                    continue
+
+                print(f"   ✅ {len(new_papers)}개 논문 검색됨")
+
+                # 기존 VectorDB에 추가
+                print("\n💾 VectorDB에 추가 중...")
+                rag.build_vectorstore_from_abstracts(new_papers, append=True)
+
+                new_chunks = rag.get_all_chunks()
+                print(f"   ✅ 완료! 현재 총 {len(new_chunks)}개 청크")
+                print("=" * 50)
+                continue
 
             # 결과 개수 조절
             k = 3
@@ -4410,13 +4999,25 @@ def run_trend_analysis():
     else:
         print("   ⚠️ OpenAI API 미설정 - 기본 요약 사용")
 
-    # 검색 소스 선택
-    print("\n📖 검색 소스 선택:")
-    print("   1. PubMed (의학/생물학) [기본값]")
-    print("   2. arXiv (CS/물리/수학)")
-    print("   3. 둘 다")
+    # 검색 소스 선택 (복수 선택 가능)
+    print("\n📖 검색 소스 선택 (복수 선택: 콤마로 구분, 예: 1,2,3):")
+    print("   1. PubMed (의학/생물학, NCBI) [기본값]")
+    print("   2. arXiv (CS/물리/수학, 프리프린트)")
+    print("   3. Europe PMC (유럽 의학/생명과학, Open Access)")
+    print("   4. 전체 (PubMed + arXiv + Europe PMC)")
     source_choice = input("선택 [1]: ").strip() or "1"
-    source = {'1': 'pubmed', '2': 'arxiv', '3': 'both'}.get(source_choice, 'pubmed')
+
+    # 복수 선택 처리
+    source_map = {'1': 'pubmed', '2': 'arxiv', '3': 'europepmc', '4': 'all'}
+    if ',' in source_choice:
+        selected = []
+        for c in source_choice.split(','):
+            c = c.strip()
+            if c in source_map:
+                selected.append(source_map[c])
+        source = ','.join(selected) if selected else 'pubmed'
+    else:
+        source = source_map.get(source_choice, 'pubmed')
 
     # 키워드 입력
     keyword = input("\n🔍 분석할 키워드 입력: ").strip()
@@ -4537,204 +5138,301 @@ def main():
         print("❌ 논문을 찾을 수 없습니다.")
         return
 
-    # 3. PDF 다운로드
-    print("\n" + "=" * 60)
-    print("📥 Step 2: PDF 다운로드")
-    print("=" * 60)
+    # Abstract 모드 선택 (PDF 다운로드 생략)
+    print("\n📌 데이터 소스 선택:")
+    print("   1. Abstract만 사용 (빠름, PDF 다운로드 생략)")
+    print("   2. Full PDF 사용 (느림, PDF 다운로드 필요)")
+    use_abstract_only = input("\n선택 [1/2, 기본값=1]: ").strip()
+    use_abstract_only = use_abstract_only != '2'  # 1 또는 빈값이면 True
 
-    downloader = PDFDownloader(PAPERS_DIR)
-    downloaded_files = downloader.download_all(papers)
+    if use_abstract_only:
+        # Abstract만 사용하는 빠른 모드
+        print("\n" + "=" * 60)
+        print("🚀 Abstract 모드 선택 - PDF 다운로드 생략")
+        print("=" * 60)
 
-    if not downloaded_files:
-        print("❌ 다운로드된 파일이 없습니다.")
-        return
+        # Abstract 요약 (OpenAI API가 있는 경우)
+        if config.openai_api_key:
+            print("\n" + "=" * 60)
+            lang_name = "한국어" if config.summary_language == 'ko' else "English"
+            print(f"📝 Step 2: Abstract AI 요약 ({lang_name})")
+            print("=" * 60)
 
-    # 4. 텍스트 추출
-    print("\n" + "=" * 60)
-    print("📄 Step 3: 텍스트 추출")
-    print("=" * 60)
+            summarizer = PaperSummarizer(
+                api_key=config.openai_api_key,
+                language=config.language,
+                summary_language=config.summary_language
+            )
+            # Abstract 모드이므로 documents 없이 호출 (모든 논문이 abstract_only로 처리됨)
+            papers = summarizer.summarize(papers, [])
 
-    documents = TextExtractor.extract_all(downloaded_files)
+        # 임베딩 모델 로드
+        print("\n" + "=" * 60)
+        step_num = "3" if config.openai_api_key else "2"
+        print(f"🧠 Step {step_num}: 임베딩 모델 로드")
+        print("=" * 60)
 
-    if not documents:
-        print("❌ 추출된 텍스트가 없습니다.")
-        return
-
-    # 5. 논문 요약 (OpenAI API 있는 경우)
-    if config.openai_api_key:
-        summarizer = PaperSummarizer(
-            api_key=config.openai_api_key,
-            language=config.language
+        embeddings = EmbeddingModelFactory.create(
+            model_type=config.embedding_model,
+            device='cpu',
+            openai_api_key=config.openai_api_key
         )
-        papers = summarizer.summarize(papers, documents)
 
-    # 6. 임베딩 모델 로드
-    print("\n" + "=" * 60)
-    print("🧠 Step 4: 임베딩 모델 로드")
-    print("=" * 60)
+        # RAG 시스템 생성 및 Abstract에서 벡터 DB 구축
+        print("\n" + "=" * 60)
+        rag_step_num = "4" if config.openai_api_key else "3"
+        print(f"💾 Step {rag_step_num}: Abstract 기반 RAG 시스템 구축")
+        print("=" * 60)
 
-    embeddings = EmbeddingModelFactory.create(
-        model_type=config.embedding_model,
-        device='cpu',
-        openai_api_key=config.openai_api_key
-    )
-
-    # 7. RAG 시스템 구축
-    print("\n" + "=" * 60)
-    print("💾 Step 5: RAG 시스템 구축")
-    print("=" * 60)
-
-    # Text Splitter 생성
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=config.chunk_size,
-        chunk_overlap=config.chunk_overlap,
-        length_function=len
-    )
-
-    # Vector DB 선택에 따라 분기
-    if config.vector_db == 'qdrant':
-        # Qdrant 기반 시스템
-        print(f"\n🗄️ Qdrant Vector DB 사용")
-
-        qdrant_search = QdrantHybridSearch(
-            embeddings=embeddings,
-            sparse_method=config.sparse_method,
-            collection_name="medical_papers",
-            use_memory=True  # 인메모리 모드
-        )
-        qdrant_search.create_collection()
-        qdrant_search.add_documents(documents, text_splitter)
-
-        # RAG 시스템도 생성 (interactive_qa용)
         rag = RAGSystem(
             embeddings=embeddings,
             chunk_size=config.chunk_size,
             chunk_overlap=config.chunk_overlap,
             language=config.language
         )
-        rag.build_vectorstore(documents)
+        rag.build_vectorstore_from_abstracts(papers)
 
-        # 8. Hybrid Search 분석 및 시각화 (Qdrant)
-        print("\n" + "=" * 60)
-        print("🔀 Step 6: Qdrant Hybrid Search 분석")
-        print("=" * 60)
+        # Qdrant도 지원 (선택된 경우)
+        qdrant_search = None
+        if config.vector_db == 'qdrant':
+            print(f"\n🗄️ Qdrant Vector DB도 구축 중...")
 
-        test_query = search_query
-        print(f"\n🔍 검색어: '{test_query}'")
-        print("-" * 40)
+            # Abstract를 documents 형식으로 변환
+            documents = []
+            for paper in papers:
+                abstract = paper.get('abstract', '')
+                if abstract and abstract != 'No abstract available':
+                    full_text = f"Title: {paper.get('title', 'Unknown')}\n\n"
+                    full_text += f"Abstract:\n{abstract}"
+                    documents.append({
+                        'text': full_text,
+                        'source': f"{paper.get('source', 'Unknown')}_{paper.get('id', 'Unknown')}"
+                    })
 
-        # Qdrant 검색 실행
-        sparse_results = qdrant_search.sparse_search(test_query, k=5)
-        dense_results = qdrant_search.dense_search(test_query, k=5)
-        hybrid_results = qdrant_search.hybrid_search(test_query, k=5, alpha=0.7)
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=config.chunk_size,
+                chunk_overlap=config.chunk_overlap,
+                length_function=len
+            )
 
-        # 실제 사용 중인 sparse 방식 (SPLADE 로드 실패 시 BM25로 폴백될 수 있음)
-        sparse_name = qdrant_search.get_sparse_method_name()
-
-        # Sparse 결과
-        print(f"\n🔵 Qdrant Sparse Search ({sparse_name}) 결과:")
-        for i, r in enumerate(sparse_results[:3], 1):
-            score = r['score']
-            source = r['source'][:50]
-            print(f"   [{i}] {sparse_name}: {score:.4f} | {source}...")
-
-        # Dense 결과 (HNSW)
-        print(f"\n🔴 Qdrant Dense Search (HNSW, {config.embedding_model}) 결과:")
-        for i, r in enumerate(dense_results[:3], 1):
-            score = r['score']
-            source = r['source'][:50]
-            print(f"   [{i}] Cosine: {score:.4f} | {source}...")
-
-        # Hybrid 결과
-        print(f"\n🟢 Qdrant Hybrid Search 결과 ({sparse_name} + Dense, α=0.7):")
-        for i, r in enumerate(hybrid_results[:3], 1):
-            hybrid_score = r.get('hybrid_score', 0)
-            sparse_score = r.get('sparse_score', 0)
-            dense_score = r.get('dense_score', 0)
-            source = r['source'][:50]
-            print(f"   [{i}] Hybrid: {hybrid_score:.3f} | Sparse={sparse_score:.3f} + Dense={dense_score:.3f}")
-            print(f"       {source}...")
-
-        # Payload 필터링 예시
-        print(f"\n🔎 Payload 필터링 테스트:")
-        filtered_results = qdrant_search.search_with_filter(
-            test_query,
-            min_chunk_length=100,
-            k=3
-        )
-        print(f"   (최소 청크 길이 100자 이상 필터)")
-        for i, r in enumerate(filtered_results[:3], 1):
-            print(f"   [{i}] {r['source'][:50]}...")
-
-        # 시각화 생성
-        print("\n📊 시각화 생성 중...")
-        qdrant_search.visualize_comparison(
-            query=test_query,
-            sparse_results=sparse_results,
-            dense_results=dense_results,
-            hybrid_results=hybrid_results,
-            alpha=0.7,
-            sparse_method=sparse_name,
-            dense_model=config.embedding_model
-        )
+            qdrant_search = QdrantHybridSearch(
+                embeddings=embeddings,
+                sparse_method=config.sparse_method,
+                collection_name="medical_papers",
+                use_memory=True
+            )
+            qdrant_search.create_collection()
+            qdrant_search.add_documents(documents, text_splitter)
+            print("   ✅ Qdrant 벡터 DB 구축 완료")
 
     else:
-        # FAISS 기반 시스템 (기존)
-        print(f"\n🗄️ FAISS Vector DB 사용")
-
-        rag = RAGSystem(
-            embeddings=embeddings,
-            chunk_size=config.chunk_size,
-            chunk_overlap=config.chunk_overlap,
-            language=config.language
-        )
-
-        vectorstore = rag.build_vectorstore(documents)
-        rag.save_vectorstore(VECTORSTORE_DIR)
-
-        # 8. Hybrid Search 분석 및 시각화 (FAISS)
+        # 기존 Full PDF 모드
+        # 3. PDF 다운로드
         print("\n" + "=" * 60)
-        print("🔀 Step 6: Hybrid Search 분석")
+        print("📥 Step 2: PDF 다운로드")
         print("=" * 60)
 
-        hybrid_searcher = HybridSearchSystem(rag, sparse_method=config.sparse_method)
+        downloader = PDFDownloader(PAPERS_DIR)
+        downloaded_files = downloader.download_all(papers)
 
-        test_query = search_query
-        print(f"\n🔍 검색어: '{test_query}'")
-        print("-" * 40)
+        if not downloaded_files:
+            print("❌ 다운로드된 파일이 없습니다.")
+            return
 
-        search_results = hybrid_searcher.compare_all(test_query, k=5, alpha=0.5)
+        # 4. 텍스트 추출
+        print("\n" + "=" * 60)
+        print("📄 Step 3: 텍스트 추출")
+        print("=" * 60)
 
-        sparse_name = config.sparse_method.upper()
+        documents = TextExtractor.extract_all(downloaded_files)
 
-        # 결과 출력
-        print(f"\n🔵 Sparse Search ({sparse_name}) 결과:")
-        for i, r in enumerate(search_results['sparse'][:3], 1):
-            sparse_score = r['score']
-            source = r['source'][:50]
-            print(f"   [{i}] {sparse_name}: {sparse_score:.2f} | {source}...")
+        if not documents:
+            print("❌ 추출된 텍스트가 없습니다.")
+            return
 
-        print(f"\n🔴 Dense Search ({config.embedding_model}) 결과:")
-        for i, r in enumerate(search_results['dense'][:3], 1):
-            l2_dist = r['score']
-            source = r['source'][:50]
-            print(f"   [{i}] L2 Dist: {l2_dist:.4f} | {source}...")
+        # 5. 논문 요약 (OpenAI API 있는 경우)
+        if config.openai_api_key:
+            summarizer = PaperSummarizer(
+                api_key=config.openai_api_key,
+                language=config.language,
+                summary_language=config.summary_language
+            )
+            papers = summarizer.summarize(papers, documents)
 
-        print(f"\n🟢 Hybrid Search 결과 ({sparse_name} + {config.embedding_model}, α=0.5):")
-        for i, r in enumerate(search_results['hybrid'][:3], 1):
-            sparse_raw = r.get('sparse_score', 0)
-            sparse_norm = r.get('sparse_score_norm', 0)
-            sem_norm = r.get('dense_score_norm', 0)
-            hybrid_score = r.get('hybrid_score', 0)
-            source = r['source'][:50]
-            print(f"   [{i}] Hybrid: {hybrid_score:.2f} | {sparse_name}={sparse_raw:.1f}({sparse_norm:.2f}) + Semantic({sem_norm:.2f})")
-            print(f"       {source}...")
+        # 6. 임베딩 모델 로드
+        print("\n" + "=" * 60)
+        print("🧠 Step 4: 임베딩 모델 로드")
+        print("=" * 60)
 
-        # 시각화 저장 및 표시
-        print("\n📊 시각화 생성 중...")
-        hybrid_searcher.visualize_comparison(test_query, k=5, alpha=0.5)
+        embeddings = EmbeddingModelFactory.create(
+            model_type=config.embedding_model,
+            device='cpu',
+            openai_api_key=config.openai_api_key
+        )
 
-    # 9. 대화형 질의응답
+        # 7. RAG 시스템 구축
+        print("\n" + "=" * 60)
+        print("💾 Step 5: RAG 시스템 구축")
+        print("=" * 60)
+
+        # Text Splitter 생성
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=config.chunk_size,
+            chunk_overlap=config.chunk_overlap,
+            length_function=len
+        )
+
+        # Vector DB 선택에 따라 분기
+        qdrant_search = None
+        if config.vector_db == 'qdrant':
+            # Qdrant 기반 시스템
+            print(f"\n🗄️ Qdrant Vector DB 사용")
+
+            qdrant_search = QdrantHybridSearch(
+                embeddings=embeddings,
+                sparse_method=config.sparse_method,
+                collection_name="medical_papers",
+                use_memory=True  # 인메모리 모드
+            )
+            qdrant_search.create_collection()
+            qdrant_search.add_documents(documents, text_splitter)
+
+            # RAG 시스템도 생성 (interactive_qa용)
+            rag = RAGSystem(
+                embeddings=embeddings,
+                chunk_size=config.chunk_size,
+                chunk_overlap=config.chunk_overlap,
+                language=config.language
+            )
+            rag.build_vectorstore(documents)
+
+            # 8. Hybrid Search 분석 및 시각화 (Qdrant)
+            print("\n" + "=" * 60)
+            print("🔀 Step 6: Qdrant Hybrid Search 분석")
+            print("=" * 60)
+
+            test_query = search_query
+            # 검색한 논문 수에 맞게 k 설정 (최소 10, 최대 논문 수)
+            search_k = max(10, config.max_results)
+            print(f"\n🔍 검색어: '{test_query}'")
+            print(f"   📊 분석 대상: 상위 {search_k}개 결과")
+            print("-" * 40)
+
+            # Qdrant 검색 실행 (논문 수에 맞게 k 조정)
+            sparse_results = qdrant_search.sparse_search(test_query, k=search_k)
+            dense_results = qdrant_search.dense_search(test_query, k=search_k)
+            hybrid_results = qdrant_search.hybrid_search(test_query, k=search_k, alpha=0.7)
+
+            # 실제 사용 중인 sparse 방식 (SPLADE 로드 실패 시 BM25로 폴백될 수 있음)
+            sparse_name = qdrant_search.get_sparse_method_name()
+
+            # Sparse 결과 (전체 표시)
+            print(f"\n🔵 Qdrant Sparse Search ({sparse_name}) 결과: {len(sparse_results)}개")
+            for i, r in enumerate(sparse_results, 1):
+                score = r['score']
+                source = r['source'][:50]
+                print(f"   [{i:2d}] {sparse_name}: {score:.4f} | {source}...")
+
+            # Dense 결과 (HNSW) (전체 표시)
+            print(f"\n🔴 Qdrant Dense Search (HNSW, {config.embedding_model}) 결과: {len(dense_results)}개")
+            for i, r in enumerate(dense_results, 1):
+                score = r['score']
+                source = r['source'][:50]
+                print(f"   [{i:2d}] Cosine: {score:.4f} | {source}...")
+
+            # Hybrid 결과 (전체 표시)
+            print(f"\n🟢 Qdrant Hybrid Search 결과 ({sparse_name} + Dense, α=0.7): {len(hybrid_results)}개")
+            for i, r in enumerate(hybrid_results, 1):
+                hybrid_score = r.get('hybrid_score', 0)
+                sparse_score = r.get('sparse_score', 0)
+                dense_score = r.get('dense_score', 0)
+                source = r['source'][:50]
+                print(f"   [{i:2d}] Hybrid: {hybrid_score:.3f} | Sparse={sparse_score:.3f} + Dense={dense_score:.3f}")
+                print(f"        {source}...")
+
+            # Payload 필터링 예시
+            print(f"\n🔎 Payload 필터링 테스트:")
+            filtered_results = qdrant_search.search_with_filter(
+                test_query,
+                min_chunk_length=100,
+                k=search_k
+            )
+            print(f"   (최소 청크 길이 100자 이상 필터): {len(filtered_results)}개")
+            for i, r in enumerate(filtered_results, 1):
+                print(f"   [{i:2d}] {r['source'][:50]}...")
+
+            # 시각화 생성
+            print("\n📊 시각화 생성 중...")
+            qdrant_search.visualize_comparison(
+                query=test_query,
+                sparse_results=sparse_results,
+                dense_results=dense_results,
+                hybrid_results=hybrid_results,
+                alpha=0.7,
+                sparse_method=sparse_name,
+                dense_model=config.embedding_model
+            )
+
+        else:
+            # FAISS 기반 시스템 (기존)
+            print(f"\n🗄️ FAISS Vector DB 사용")
+
+            rag = RAGSystem(
+                embeddings=embeddings,
+                chunk_size=config.chunk_size,
+                chunk_overlap=config.chunk_overlap,
+                language=config.language
+            )
+
+            vectorstore = rag.build_vectorstore(documents)
+            rag.save_vectorstore(VECTORSTORE_DIR)
+
+            # 8. Hybrid Search 분석 및 시각화 (FAISS)
+            print("\n" + "=" * 60)
+            print("🔀 Step 6: Hybrid Search 분석")
+            print("=" * 60)
+
+            hybrid_searcher = HybridSearchSystem(rag, sparse_method=config.sparse_method)
+
+            test_query = search_query
+            # 검색한 논문 수에 맞게 k 설정 (최소 10, 최대 논문 수)
+            search_k = max(10, config.max_results)
+            print(f"\n🔍 검색어: '{test_query}'")
+            print(f"   📊 분석 대상: 상위 {search_k}개 결과")
+            print("-" * 40)
+
+            search_results = hybrid_searcher.compare_all(test_query, k=search_k, alpha=0.5)
+
+            sparse_name = config.sparse_method.upper()
+
+            # 결과 출력 (전체 표시)
+            print(f"\n🔵 Sparse Search ({sparse_name}) 결과: {len(search_results['sparse'])}개")
+            for i, r in enumerate(search_results['sparse'], 1):
+                sparse_score = r['score']
+                source = r['source'][:50]
+                print(f"   [{i:2d}] {sparse_name}: {sparse_score:.2f} | {source}...")
+
+            print(f"\n🔴 Dense Search ({config.embedding_model}) 결과: {len(search_results['dense'])}개")
+            for i, r in enumerate(search_results['dense'], 1):
+                l2_dist = r['score']
+                source = r['source'][:50]
+                print(f"   [{i:2d}] L2 Dist: {l2_dist:.4f} | {source}...")
+
+            print(f"\n🟢 Hybrid Search 결과 ({sparse_name} + {config.embedding_model}, α=0.5): {len(search_results['hybrid'])}개")
+            for i, r in enumerate(search_results['hybrid'], 1):
+                sparse_raw = r.get('sparse_score', 0)
+                sparse_norm = r.get('sparse_score_norm', 0)
+                sem_norm = r.get('dense_score_norm', 0)
+                hybrid_score = r.get('hybrid_score', 0)
+                source = r['source'][:50]
+                print(f"   [{i:2d}] Hybrid: {hybrid_score:.2f} | {sparse_name}={sparse_raw:.1f}({sparse_norm:.2f}) + Semantic({sem_norm:.2f})")
+                print(f"        {source}...")
+
+            # 시각화 저장 및 표시
+            print("\n📊 시각화 생성 중...")
+            hybrid_searcher.visualize_comparison(test_query, k=search_k, alpha=0.5)
+
+    # 9. 대화형 질의응답 (Abstract 모드와 PDF 모드 모두 여기로 옴)
     interactive_qa(rag, config.openai_api_key)
 
     print("\n" + "=" * 60)

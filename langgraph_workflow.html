@@ -9,135 +9,63 @@
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            margin: 0;
-            padding: 20px;
-            min-height: 100vh;
+            margin: 0; padding: 20px; min-height: 100vh;
         }
         .container {
-            max-width: 900px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 16px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            padding: 40px;
+            max-width: 900px; margin: 0 auto; background: white;
+            border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); padding: 40px;
         }
-        h1 {
-            text-align: center;
-            color: #1e293b;
-            margin-bottom: 10px;
-        }
-        .subtitle {
-            text-align: center;
-            color: #64748b;
-            margin-bottom: 30px;
-        }
+        h1 { text-align: center; color: #1e293b; margin-bottom: 10px; }
+        .subtitle { text-align: center; color: #64748b; margin-bottom: 30px; }
         .mermaid {
-            display: flex;
-            justify-content: center;
-            background: #f8fafc;
-            border-radius: 12px;
-            padding: 30px;
-            margin: 20px 0;
-        }
-        .legend {
-            display: flex;
-            justify-content: center;
-            gap: 30px;
-            margin-top: 20px;
-            flex-wrap: wrap;
-        }
-        .legend-item {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        .legend-color {
-            width: 20px;
-            height: 20px;
-            border-radius: 4px;
+            display: flex; justify-content: center; background: #f8fafc;
+            border-radius: 12px; padding: 30px; margin: 20px 0;
         }
         .steps {
-            margin-top: 30px;
-            padding: 20px;
-            background: #f1f5f9;
-            border-radius: 12px;
+            margin-top: 30px; padding: 20px; background: #f1f5f9; border-radius: 12px;
         }
         .step {
-            display: flex;
-            align-items: center;
-            padding: 12px 0;
+            display: flex; align-items: center; padding: 12px 0;
             border-bottom: 1px solid #e2e8f0;
         }
-        .step:last-child {
-            border-bottom: none;
-        }
+        .step:last-child { border-bottom: none; }
         .step-num {
-            width: 30px;
-            height: 30px;
-            background: #0ea5e9;
-            color: white;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-weight: bold;
-            margin-right: 15px;
+            width: 30px; height: 30px; background: #0ea5e9; color: white;
+            border-radius: 50%; display: flex; align-items: center;
+            justify-content: center; font-weight: bold; margin-right: 15px;
         }
-        .step-content h3 {
-            margin: 0;
-            color: #1e293b;
-        }
-        .step-content p {
-            margin: 5px 0 0;
-            color: #64748b;
-            font-size: 14px;
-        }
-        .footer {
-            text-align: center;
-            margin-top: 30px;
-            color: #94a3b8;
-            font-size: 14px;
-        }
+        .step-content h3 { margin: 0; color: #1e293b; }
+        .step-content p { margin: 5px 0 0; color: #64748b; font-size: 14px; }
+        .footer { text-align: center; margin-top: 30px; color: #94a3b8; font-size: 14px; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>🔄 LangGraph RAG Workflow</h1>
         <p class="subtitle">Medical/Scientific Paper RAG System</p>
-        
         <div class="mermaid">
+---
+config:
+  flowchart:
+    curve: linear
+---
 graph TD;
 	__start__([<p>__start__</p>]):::first
-	process_query(process_query<br/>쿼리 처리 & 번역)
-	retrieve_documents(retrieve_documents<br/>벡터 DB 검색)
-	create_context(create_context<br/>컨텍스트 구성)
-	generate_answer(generate_answer<br/>LLM 답변 생성)
+	process_query(process_query)
+	retrieve_documents(retrieve_documents)
+	create_context(create_context)
+	generate_answer(generate_answer)
 	__end__([<p>__end__</p>]):::last
 	__start__ --> process_query;
+	create_context --> generate_answer;
 	process_query --> retrieve_documents;
 	retrieve_documents --> create_context;
-	create_context --> generate_answer;
 	generate_answer --> __end__;
-	classDef default fill:#e8f4f8,stroke:#0ea5e9,stroke-width:2px
-	classDef first fill:#22c55e,stroke:#16a34a,color:white
-	classDef last fill:#8b5cf6,stroke:#7c3aed,color:white
+	classDef default fill:#f2f0ff,line-height:1.2
+	classDef first fill-opacity:0
+	classDef last fill:#bfb6fc
+
         </div>
-        
-        <div class="legend">
-            <div class="legend-item">
-                <div class="legend-color" style="background: #22c55e;"></div>
-                <span>시작</span>
-            </div>
-            <div class="legend-item">
-                <div class="legend-color" style="background: #e8f4f8; border: 2px solid #0ea5e9;"></div>
-                <span>처리 노드</span>
-            </div>
-            <div class="legend-item">
-                <div class="legend-color" style="background: #8b5cf6;"></div>
-                <span>종료</span>
-            </div>
-        </div>
-        
         <div class="steps">
             <div class="step">
                 <div class="step-num">1</div>
@@ -168,23 +96,10 @@ graph TD;
                 </div>
             </div>
         </div>
-        
         <div class="footer">
-            <p>📊 LangSmith에서 실시간 모니터링: <a href="https://smith.langchain.com" target="_blank">smith.langchain.com</a></p>
-            <p>Generated by Medical Paper RAG System</p>
+            <p>📊 LangSmith: <a href="https://smith.langchain.com">smith.langchain.com</a></p>
         </div>
     </div>
-    
-    <script>
-        mermaid.initialize({ 
-            startOnLoad: true,
-            theme: 'base',
-            themeVariables: {
-                primaryColor: '#e8f4f8',
-                primaryBorderColor: '#0ea5e9',
-                lineColor: '#64748b'
-            }
-        });
-    </script>
+    <script>mermaid.initialize({ startOnLoad: true, theme: 'base' });</script>
 </body>
 </html>
